@@ -1,163 +1,21 @@
 --[[
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  BKS HUB — Delta Nil Catcher                                                ║
-║                                                                              ║
-║  Intercepta exactamente qué función es nil cuando Luraph arranca.           ║
-║  Ejecutar ANTES del hub. Copia la URL resultante y pega en el chat.         ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+  BKS HUB — Delta Report
+  Ejecutar DESPUÉS de cargar el hub (aunque crashee).
+  Muestra qué funciones llamó Luraph y si alguna falló.
 --]]
 
--- ── 1. Diagnóstico correcto (sin bug de doble type()) ────────────────────────
-local diag = {}
-local function rawChk(name, fn)
-    local ok, raw = pcall(fn)
-    if not ok then
-        diag[#diag+1] = name .. " = ERROR: " .. tostring(raw):sub(1,80)
-    else
-        -- mostrar valor real, no type(type(...))
-        if type(raw) == "function" then
-            diag[#diag+1] = name .. " = function ✓"
-        elseif raw == nil then
-            diag[#diag+1] = name .. " = NIL ✗✗✗"
-        else
-            diag[#diag+1] = name .. " = " .. type(raw) .. "(" .. tostring(raw):sub(1,40) .. ")"
-        end
-    end
+local log = (type(getgenv)=="function" and getgenv().__BKS_NIL_LOG__)
+         or _G.__BKS_NIL_LOG__
+         or {}
+
+local out
+if #log == 0 then
+    out = "[BKS REPORT] nilLog vacío — el hub no llamó funciones interceptadas,\n"
+       .. "o el catcher no se ejecutó antes del hub."
+else
+    out = "=== BKS Nil Catcher Report ===\n" .. table.concat(log, "\n")
 end
 
-rawChk("getfenv",        function() return getfenv         end)
-rawChk("setfenv",        function() return setfenv         end)
-rawChk("getgenv",        function() return getgenv         end)
-rawChk("newcclosure",    function() return newcclosure      end)
-rawChk("hookfunction",   function() return hookfunction     end)
-rawChk("clonefunction",  function() return clonefunction    end)
-rawChk("getupvalues",    function() return getupvalues      end)
-rawChk("setupvalue",     function() return setupvalue       end)
-rawChk("getprotos",      function() return getprotos        end)
-rawChk("is_closure",     function() return is_closure or isclosure end)
-rawChk("iscclosure",     function() return iscclosure       end)
-rawChk("checkcaller",    function() return checkcaller      end)
-rawChk("debug",          function() return debug            end)
-rawChk("debug.getinfo",  function() return debug and debug.getinfo  end)
-rawChk("debug.getupvalue",function() return debug and debug.getupvalue end)
-rawChk("debug.getupvalues",function() return debug and debug.getupvalues end)
-rawChk("debug.getprotos",function() return debug and debug.getprotos end)
-rawChk("debug.getfenv",  function() return debug and debug.getfenv  end)
-rawChk("string.dump",    function() return string.dump      end)
-
--- Tests reales (¿funciona cuando se llama?)
-rawChk("[CALL] getfenv(1)",   function()
-    if type(getfenv)~="function" then return nil end
-    return getfenv(1)   -- debe retornar una tabla
-end)
-rawChk("[CALL] getfenv(0)",   function()
-    if type(getfenv)~="function" then return nil end
-    return getfenv(0)
-end)
-rawChk("[CALL] newcclosure",  function()
-    if type(newcclosure)~="function" then return nil end
-    return newcclosure(function() end)
-end)
-rawChk("[CALL] debug.getinfo(1,'Su')", function()
-    if type(debug)~="table" or type(debug.getinfo)~="function" then return nil end
-    return debug.getinfo(1,"Su")
-end)
-rawChk("[CALL] getupvalues(print)", function()
-    if type(getupvalues)~="function" then return nil end
-    return getupvalues(print)
-end)
-rawChk("[WRITE] getfenv(1).test=1", function()
-    if type(getfenv)~="function" then return nil end
-    local env = getfenv(1)
-    env.__DELTA_TEST__ = 123
-    return env.__DELTA_TEST__  -- ¿se puede escribir?
-end)
-
--- ── 2. Intercepción: envolver funciones con logging ANTES de cargar el hub ───
--- Luraph LPH en su línea 1 normalmente hace UNA de estas cosas:
---   a) getfenv(1) o getfenv(0)
---   b) newcclosure(fn)
---   c) debug.getinfo(fn,"Su")
---   d) Llama a algún global con nombre extraño
---
--- Si ninguna de esas es nil, entonces lo nil es algo DENTRO del hub mismo
--- (una función del juego, un servicio, etc.)
-
-local nilLog = {}
-local function wrapLog(name, fn)
-    if type(fn) ~= "function" then return fn end
-    return newcclosure and newcclosure(function(...)
-        local results = table.pack(pcall(fn, ...))
-        if not results[1] then
-            nilLog[#nilLog+1] = "[CALL ERROR] " .. name .. " → " .. tostring(results[2])
-        end
-        return table.unpack(results, 2)
-    end) or fn
-end
-
--- Envolver funciones clave del entorno global para detectar crashes
-local _genv = (type(getgenv)=="function" and getgenv()) or _G
-local _orig = {}
-
-local TO_WRAP = {
-    "getfenv","setfenv","newcclosure","hookfunction","clonefunction",
-    "getupvalues","getprotos","is_closure","isclosure","iscclosure",
-    "checkcaller","setreadonly","loadstring",
-}
-
-for _, name in ipairs(TO_WRAP) do
-    _orig[name] = _genv[name]
-    local orig = _genv[name]
-    if type(orig)=="function" then
-        pcall(function()
-            _genv[name] = function(...)
-                nilLog[#nilLog+1] = "[PRE] called: " .. name
-                local r = table.pack(pcall(orig,...))
-                if not r[1] then
-                    nilLog[#nilLog+1] = "[ERR] " .. name .. " → " .. tostring(r[2])
-                end
-                return table.unpack(r, 2)
-            end
-        end)
-    end
-end
-
--- Envolver debug.getinfo
-if type(debug)=="table" and type(debug.getinfo)=="function" then
-    local orig_gi = debug.getinfo
-    pcall(function()
-        debug.getinfo = function(...)
-            nilLog[#nilLog+1] = "[PRE] called: debug.getinfo"
-            local r = table.pack(pcall(orig_gi,...))
-            if not r[1] then
-                nilLog[#nilLog+1] = "[ERR] debug.getinfo → " .. tostring(r[2])
-            end
-            return table.unpack(r, 2)
-        end
-    end)
-end
-
--- ── 3. Output del diagnóstico ─────────────────────────────────────────────────
-local diagOut = "=== BKS Delta Diagnostics v2 ===\n" .. table.concat(diag, "\n")
-print(diagOut)
-
--- ── 4. Instrucciones para el usuario ─────────────────────────────────────────
-print("\n" .. string.rep("─",60))
-print("Ahora carga el hub. Luego ejecuta BKS_DELTA_REPORT.lua")
-print("para ver qué funciones llamó Luraph justo antes de crashear.")
-print(string.rep("─",60))
-
--- Guardar nilLog en global para accederlo después
-pcall(function() getgenv().__BKS_NIL_LOG__ = nilLog end)
-pcall(function() _G.__BKS_NIL_LOG__ = nilLog end)
-
--- Restaurar funciones originales después de 30s
-task.delay(30, function()
-    for name, orig in pairs(_orig) do
-        pcall(function() _genv[name] = orig end)
-    end
-    print("[BKS] Funciones originales restauradas.")
-end)
-
-pcall(setclipboard, diagOut)
-print("[DIAG v2] Output en clipboard.")
+print(out)
+pcall(setclipboard, out)
+print("[REPORT] Output en clipboard.")
