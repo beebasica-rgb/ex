@@ -1,121 +1,168 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  BKS HUB — Delta Patcher                                                    ║
+║  BKS HUB — Delta Patcher v2                                                 ║
 ║                                                                              ║
-║  Stub de las funciones que faltan en Delta y que el hub / Luraph necesita.  ║
-║  Faltan: debug.getfenv · is_closure · string.dump                           ║
+║  Fix 1 (v1): debug.getfenv / debug.setfenv / is_closure / string.dump      ║
+║  Fix 2 (v2): "attempt to modify a readonly table" en línea 21 de Luraph   ║
+║              → desproteger entorno global y tablas de biblioteca            ║
 ║                                                                              ║
 ║  INSTRUCCIONES:                                                              ║
 ║  1. Ejecutar ESTE script                                                     ║
-║  2. Esperar el mensaje "Patcher listo"                                       ║
+║  2. Esperar "✅ Patcher listo"                                               ║
 ║  3. Cargar el hub normalmente                                                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 --]]
 
-local patched = {}
+local report = {}
+local function ok(msg)  report[#report+1] = "  ✓ " .. msg end
+local function fail(msg) report[#report+1] = "  ✗ " .. msg end
+local function info(msg) report[#report+1] = "  · " .. msg end
 
--- ── debug.getfenv ─────────────────────────────────────────────────────────────
--- Luraph LPH usa esto para leer/escribir el entorno de la función protegida.
--- Sin esto, Luraph llama nil → "attempt to call a nil value" en línea 1.
+-- ── 0. Desproteger tablas readonly ────────────────────────────────────────────
+-- Luraph (~línea 21) intenta escribir en el entorno global o en debug.
+-- setreadonly(t, false) las hace escribibles.
+do
+    local sr = setreadonly
+    if type(sr) ~= "function" then
+        fail("setreadonly no existe — skip unlock")
+    else
+        local targets = {
+            { getgenv and getgenv() or nil, "getgenv()" },
+            { getrenv and getrenv() or nil, "getrenv()" },
+            { _G,                           "_G"         },
+            { debug,                        "debug"      },
+            { string,                       "string"     },
+            { math,                         "math"       },
+            { table,                        "table"      },
+            { coroutine,                    "coroutine"  },
+            { os,                           "os"         },
+        }
+        for _, t in ipairs(targets) do
+            local tbl, name = t[1], t[2]
+            if type(tbl) == "table" then
+                local r = pcall(sr, tbl, false)
+                if r then ok("unlock " .. name)
+                else info("unlock " .. name .. " (ya writable o protegido)") end
+            end
+        end
+    end
+end
+
+-- ── 1. debug.getfenv ─────────────────────────────────────────────────────────
 if type(debug) == "table" and debug.getfenv == nil then
-    debug.getfenv = function(f)
-        if type(f) == "number" then
-            -- nivel de stack: 0 = thread env, 1 = caller, etc.
-            local ok, env = pcall(getfenv, f + 1)
-            return ok and type(env) == "table" and env or getfenv(0)
-        elseif type(f) == "function" then
-            local ok, env = pcall(getfenv, f)
-            return ok and type(env) == "table" and env or getfenv(0)
+    local r = pcall(function()
+        debug.getfenv = function(f)
+            if type(f) == "number" then
+                local ok2, env = pcall(getfenv, f + 1)
+                return ok2 and type(env) == "table" and env or getfenv(0)
+            elseif type(f) == "function" then
+                local ok2, env = pcall(getfenv, f)
+                return ok2 and type(env) == "table" and env or getfenv(0)
+            end
+            return getfenv(0)
         end
-        return getfenv(0)
-    end
-    patched[#patched+1] = "debug.getfenv ✓"
+    end)
+    if r then ok("debug.getfenv stub") else fail("debug.getfenv stub FAILED") end
 else
-    patched[#patched+1] = "debug.getfenv ya existe, skip"
+    info("debug.getfenv ya existe")
 end
 
--- ── debug.setfenv ─────────────────────────────────────────────────────────────
--- Luraph también puede necesitar setfenv via debug.
+-- ── 2. debug.setfenv ─────────────────────────────────────────────────────────
 if type(debug) == "table" and debug.setfenv == nil then
-    debug.setfenv = function(f, env)
-        if type(f) == "number" then
-            local ok, err = pcall(setfenv, f + 1, env)
-            return ok
-        elseif type(f) == "function" then
-            local ok, err = pcall(setfenv, f, env)
-            return ok
+    local r = pcall(function()
+        debug.setfenv = function(f, env)
+            if type(f) == "number" then
+                return pcall(setfenv, f + 1, env)
+            elseif type(f) == "function" then
+                return pcall(setfenv, f, env)
+            end
+            return false
         end
-        return false
-    end
-    patched[#patched+1] = "debug.setfenv ✓"
+    end)
+    if r then ok("debug.setfenv stub") else fail("debug.setfenv stub FAILED") end
 else
-    patched[#patched+1] = "debug.setfenv ya existe, skip"
+    info("debug.setfenv ya existe")
 end
 
--- ── is_closure ────────────────────────────────────────────────────────────────
--- El hub usa esto para verificar si algo es una closure de Lua.
--- Delta tiene isclosure pero no is_closure.
+-- ── 3. is_closure ─────────────────────────────────────────────────────────────
 local genv = (type(getgenv) == "function" and getgenv()) or _G
-
 if genv.is_closure == nil then
-    -- isclosure: true si es función Lua (no C)
-    local _isclosure = genv.isclosure or genv.islclosure
-    genv.is_closure = _isclosure or function(f)
-        if type(f) ~= "function" then return false end
-        -- Si iscclosure existe: is_closure = NOT iscclosure
-        if type(genv.iscclosure) == "function" then
-            local ok, isc = pcall(genv.iscclosure, f)
-            return ok and not isc or false
+    local r = pcall(function()
+        local _isc = genv.isclosure or genv.islclosure
+        genv.is_closure = _isc or function(f)
+            if type(f) ~= "function" then return false end
+            if type(genv.iscclosure) == "function" then
+                local ok2, isc = pcall(genv.iscclosure, f)
+                return ok2 and not isc or false
+            end
+            return true
         end
-        return true -- asumir Lua closure
-    end
-    patched[#patched+1] = "is_closure ✓"
+    end)
+    if r then ok("is_closure stub") else fail("is_closure stub FAILED") end
 else
-    patched[#patched+1] = "is_closure ya existe, skip"
+    info("is_closure ya existe")
 end
 
--- ── string.dump ───────────────────────────────────────────────────────────────
--- Luraph puede usar string.dump para verificar bytecode.
--- Delta no lo expone. Un stub que retorna vacío evita el crash.
+-- ── 4. string.dump ────────────────────────────────────────────────────────────
 if string.dump == nil then
-    string.dump = function(f, strip)
-        -- retornar bytecode falso mínimo (header Lua 5.1)
-        -- Luraph normalmente solo chequea que no sea nil
-        return "\27Lua\81\0\1\4\4\4\8\0"
-    end
-    patched[#patched+1] = "string.dump ✓ (stub)"
+    local r = pcall(function()
+        string.dump = function(f, strip)
+            return "\27Lua\81\0\1\4\4\4\8\0"
+        end
+    end)
+    if r then ok("string.dump stub") else fail("string.dump stub FAILED") end
 else
-    patched[#patched+1] = "string.dump ya existe, skip"
+    info("string.dump ya existe")
 end
 
--- ── Verificación post-patch ───────────────────────────────────────────────────
-print("╔══════════════════════════════════════╗")
-print("║   BKS Delta Patcher — Resultados    ║")
-print("╚══════════════════════════════════════╝")
-for _, msg in ipairs(patched) do
-    print("  " .. msg)
+-- ── 5. Verificar que debug.getfenv puede escribir en su resultado ─────────────
+-- Luraph no solo llama debug.getfenv, también escribe en la tabla que retorna.
+do
+    if type(debug) == "table" and type(debug.getfenv) == "function" then
+        local testOk = pcall(function()
+            local env = debug.getfenv(0)
+            assert(type(env) == "table")
+            -- intentar desproteger también el env si hace falta
+            if type(setreadonly) == "function" then
+                pcall(setreadonly, env, false)
+            end
+            env.__bks_test__ = 1
+            assert(env.__bks_test__ == 1)
+            env.__bks_test__ = nil
+        end)
+        if testOk then ok("debug.getfenv env es writable")
+        else fail("debug.getfenv env es READONLY — Luraph aún fallará") end
+    end
 end
 
--- Verificar que debug.getfenv funciona
-local testOk = pcall(function()
-    local env = debug.getfenv(0)
-    assert(type(env) == "table", "no retornó tabla")
-end)
-print("")
-print("  debug.getfenv test: " .. (testOk and "✓ OK" or "✗ FALLÓ"))
+-- ── 6. Hacer writable el env de cada nivel de stack ─────────────────────────
+-- Luraph hace debug.getfenv(n) para n=0,1,2,... y escribe en esos envs.
+do
+    if type(setreadonly) == "function" then
+        for level = 0, 5 do
+            pcall(function()
+                local env
+                if type(debug) == "table" and type(debug.getfenv) == "function" then
+                    env = debug.getfenv(level)
+                else
+                    env = getfenv(level > 0 and level or 1)
+                end
+                if type(env) == "table" then
+                    setreadonly(env, false)
+                end
+            end)
+        end
+        ok("stack envs unlocked (niveles 0-5)")
+    end
+end
 
--- Verificar is_closure
-local isClOk = pcall(function()
-    assert(type(is_closure) == "function")
-    local r = is_closure(print)
-    -- print es C closure, debería retornar false
-end)
-print("  is_closure test:    " .. (isClOk and "✓ OK" or "✗ FALLÓ"))
-
+-- ── Output ────────────────────────────────────────────────────────────────────
+print("╔══════════════════════════════════════════╗")
+print("║   BKS Delta Patcher v2 — Resultados     ║")
+print("╚══════════════════════════════════════════╝")
+for _, line in ipairs(report) do print(line) end
 print("")
 print("  ✅ Patcher listo. Carga el hub ahora.")
 print("")
 
--- Guardar referencia para saber si el patcher corrió
-pcall(function() getgenv().__BKS_PATCHED__ = true end)
-pcall(function() _G.__BKS_PATCHED__ = true end)
+pcall(function() getgenv().__BKS_PATCHED__ = 2 end)
