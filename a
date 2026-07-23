@@ -1,21 +1,649 @@
 --[[
-  BKS HUB — Delta Report
-  Ejecutar DESPUÉS de cargar el hub (aunque crashee).
-  Muestra qué funciones llamó Luraph y si alguna falló.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║   BKS HUB — GUI EXTRACTOR v3                                                ║
+║                                                                              ║
+║   FIXES vs v2:                                                               ║
+║   • Busca _zk768057 EXACTO — ya no confunde notificaciones (_zkN_*) con     ║
+║     la GUI principal                                                         ║
+║   • Espera ESTABILIDAD real — cuenta descendientes cada 0.5s hasta que      ║
+║     el número deje de crecer (hub tarda ~10s en buildGUI)                   ║
+║   • F8 captura todas las _zk* ScreenGui que existan en ese momento          ║
+║   • Fallback de typeof() robusto                                             ║
+║                                                                              ║
+║   USO:                                                                       ║
+║   1. Ejecutar ESTE script PRIMERO (antes del hub)                            ║
+║   2. Cargar el hub y esperar a que aparezca la GUI completa                  ║
+║   3. Presionar F8 para capturar AHORA (recomendado, más control)            ║
+║      ─── O ───                                                               ║
+║      Esperar la detección automática de _zk768057 + estabilización          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 --]]
 
-local log = (type(getgenv)=="function" and getgenv().__BKS_NIL_LOG__)
-         or _G.__BKS_NIL_LOG__
-         or {}
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CONFIGURACIÓN
+-- ─────────────────────────────────────────────────────────────────────────────
+local CFG = {
+    -- ── Espera automática ───────────────────────────────────────────────────
+    WAIT_FOR_HUB   = true,   -- true = esperar auto | false = F8 inmediato
 
-local out
-if #log == 0 then
-    out = "[BKS REPORT] nilLog vacío — el hub no llamó funciones interceptadas,\n"
-       .. "o el catcher no se ejecutó antes del hub."
-else
-    out = "=== BKS Nil Catcher Report ===\n" .. table.concat(log, "\n")
+    -- ScreenGui PRINCIPAL del hub (nombre exacto, no buscar prefijo)
+    SGUI_MAIN      = "_zk768057",
+
+    -- Otras ScreenGui del hub (se capturan junto al main)
+    SGUI_EXTRAS    = { "_zkOverlay_876775", "_zkOpenBtn" },
+
+    -- Estabilización: esperar N checks consecutivos sin cambio en descendientes
+    STABLE_CHECKS  = 4,      -- 4 checks × 0.5s = 2s sin cambios = GUI lista
+    STABLE_INTERVAL= 0.5,    -- segundos entre checks
+    STABLE_TIMEOUT = 60,     -- segundos máximos esperando estabilización
+
+    DETECT_TIMEOUT = 120,    -- segundos máximos esperando que aparezca la GUI
+
+    -- ── Output ──────────────────────────────────────────────────────────────
+    SAVE_CLIPBOARD = true,
+    SAVE_HASTEBIN  = true,
+    PRINT_CHUNKS   = true,
+
+    -- ── Extracción ──────────────────────────────────────────────────────────
+    SKIP_TABS      = false,  -- true = omitir interior de TabFrame_* (output más pequeño)
+    MAX_DEPTH      = 0,      -- 0 = sin límite
+
+    FORCE_PROPS    = {
+        Name=true, Size=true, Position=true,
+        Text=true, Image=true, CornerRadius=true,
+    },
+
+    -- ── Tecla manual ────────────────────────────────────────────────────────
+    -- F8 = capturar AHORA (todas las _zk* ScreenGui presentes)
+    MANUAL_KEY     = Enum.KeyCode.F8,
+}
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SERVICIOS Y REFERENCIAS (antes de cualquier hook)
+-- ─────────────────────────────────────────────────────────────────────────────
+local Players       = game:GetService("Players")
+local CoreGuiSvc    = game:GetService("CoreGui")
+local StarterGuiSvc = game:GetService("StarterGui")
+local UIS           = game:GetService("UserInputService")
+local HttpSvc       = game:GetService("HttpService")
+local LocalPlayer   = Players.LocalPlayer
+local PlayerGui     = LocalPlayer:WaitForChild("PlayerGui", 30)
+
+local _pcall  = pcall
+local _type   = type
+local _tostr  = tostring
+local _ipairs = ipairs
+local _pairs  = pairs
+local _ins    = table.insert
+local _cat    = table.concat
+local _fmt    = string.format
+local _rep    = string.rep
+local _floor  = math.floor
+local _abs    = math.abs
+local _ceil   = math.ceil
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- typeof() con fallback robusto
+-- ─────────────────────────────────────────────────────────────────────────────
+local _typeof
+do
+    local ok, tf = _pcall(function() return typeof end)
+    if ok and _type(tf) == "function" then
+        _typeof = tf
+    else
+        _typeof = function(v)
+            local t = _type(v)
+            if t ~= "userdata" then return t end
+            -- Detectar tipos Roblox por propiedades únicas
+            if _pcall(function() local _=v.R+v.G+v.B end) then return "Color3" end
+            if _pcall(function() local _=v.X.Scale+v.Y.Scale end) then return "UDim2" end
+            if _pcall(function() local _=v.Scale+v.Offset end) then return "UDim" end
+            do
+                local ok2, kp = _pcall(function() return v.Keypoints end)
+                if ok2 and kp and #kp > 0 then
+                    if _pcall(function() local _=kp[1].Value.R end) then return "ColorSequence" end
+                    return "NumberSequence"
+                end
+            end
+            if _pcall(function() local _=v.EnumType end) then return "EnumItem" end
+            if _pcall(function() local _=v.X+v.Y end) then return "Vector2" end
+            local ok3, cn = _pcall(function() return v.ClassName end)
+            return ok3 and cn or "userdata"
+        end
+    end
 end
 
-print(out)
-pcall(setclipboard, out)
-print("[REPORT] Output en clipboard.")
+-- ─────────────────────────────────────────────────────────────────────────────
+-- UTILIDADES
+-- ─────────────────────────────────────────────────────────────────────────────
+local function safeProp(inst, prop)
+    local ok, v = _pcall(function() return inst[prop] end)
+    return ok, v
+end
+local function safeClass(inst)
+    local ok, v = _pcall(function() return inst.ClassName end)
+    return ok and v or ""
+end
+local function safeName(inst)
+    local ok, v = _pcall(function() return inst.Name end)
+    return ok and v or ""
+end
+local function safeChildren(inst)
+    local ok, v = _pcall(function() return inst:GetChildren() end)
+    return ok and v or {}
+end
+local function safeDescCount(inst)
+    local ok, v = _pcall(function() return #inst:GetDescendants() end)
+    return ok and v or 0
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SERIALIZADORES
+-- ─────────────────────────────────────────────────────────────────────────────
+local function rnd(n, d) local f=10^(d or 4); return _floor(n*f+.5)/f end
+local function serNum(n)
+    if n==_floor(n) and _abs(n)<1e7 then return _tostr(_floor(n)) end
+    return (_fmt("%.6f",n):gsub("%.?0+$",""))
+end
+local function serStr(s)
+    return '"'.._tostr(s):gsub("\\","\\\\"):gsub('"','\\"'):gsub("\n","\\n"):gsub("\r","\\r")..'"'
+end
+local function serC3(c)
+    return _fmt("Color3.fromRGB(%d,%d,%d)",_floor(c.R*255+.5),_floor(c.G*255+.5),_floor(c.B*255+.5))
+end
+local function serUDim2(u)
+    return _fmt("UDim2.new(%s,%d,%s,%d)",
+        _tostr(rnd(u.X.Scale,5)),_floor(u.X.Offset+.5),
+        _tostr(rnd(u.Y.Scale,5)),_floor(u.Y.Offset+.5))
+end
+local function serUDim(u)
+    return _fmt("UDim.new(%s,%d)",_tostr(rnd(u.Scale,5)),_floor(u.Offset+.5))
+end
+local function serV2(v) return _fmt("Vector2.new(%s,%s)",serNum(v.X),serNum(v.Y)) end
+local function serColorSeq(cs)
+    local p={}
+    for _,kp in _ipairs(cs.Keypoints) do
+        _ins(p,_fmt("    ColorSequenceKeypoint.new(%s,%s)",serNum(kp.Time),serC3(kp.Value)))
+    end
+    return "ColorSequence.new({\n".._cat(p,",\n").."\n})"
+end
+local function serNumSeq(ns)
+    local p={}
+    for _,kp in _ipairs(ns.Keypoints) do
+        _ins(p,_fmt("    NumberSequenceKeypoint.new(%s,%s,%s)",serNum(kp.Time),serNum(kp.Value),serNum(kp.Envelope)))
+    end
+    return "NumberSequence.new({\n".._cat(p,",\n").."\n})"
+end
+local function serRect(r)
+    return _fmt("Rect.new(%s,%s,%s,%s)",serNum(r.Min.X),serNum(r.Min.Y),serNum(r.Max.X),serNum(r.Max.Y))
+end
+local function serVal(v)
+    local t=_typeof(v)
+    if t=="nil" then return "nil"
+    elseif t=="boolean" then return _tostr(v)
+    elseif t=="number"  then return serNum(v)
+    elseif t=="string"  then return serStr(v)
+    elseif t=="Color3"  then return serC3(v)
+    elseif t=="UDim2"   then return serUDim2(v)
+    elseif t=="UDim"    then return serUDim(v)
+    elseif t=="Vector2" then return serV2(v)
+    elseif t=="ColorSequence"  then return serColorSeq(v)
+    elseif t=="NumberSequence" then return serNumSeq(v)
+    elseif t=="Rect"    then return serRect(v)
+    elseif t=="EnumItem" then
+        local ok,s=_pcall(_tostr,v); return ok and s or "nil"
+    else
+        local ok,s=_pcall(_tostr,v)
+        if ok and s and s~="" and s~="nil" then return serStr(s) end
+        return "nil"
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PROPIEDADES
+-- ─────────────────────────────────────────────────────────────────────────────
+local GUI_BASE = {
+    "Name","Size","Position","AnchorPoint",
+    "BackgroundColor3","BackgroundTransparency",
+    "BorderSizePixel","Visible","ZIndex",
+    "ClipsDescendants","Active","AutomaticSize","LayoutOrder","Rotation",
+}
+local CLASS_PROPS = {
+    ScreenGui    = {"Name","ResetOnSpawn","Enabled","ZIndexBehavior","IgnoreGuiInset","DisplayOrder"},
+    Frame        = {},
+    CanvasGroup  = {"GroupTransparency","GroupColor3"},
+    ScrollingFrame = {
+        "ScrollBarThickness","ScrollBarImageColor3","ScrollBarImageTransparency",
+        "CanvasSize","AutomaticCanvasSize","ScrollingDirection",
+        "VerticalScrollBarInset","HorizontalScrollBarInset","ScrollingEnabled",
+    },
+    ImageLabel   = {"Image","ImageColor3","ImageTransparency","ScaleType","TileSize","SliceCenter","SliceScale","ResampleMode"},
+    ImageButton  = {"Image","ImageColor3","ImageTransparency","ScaleType","TileSize","HoverImage","PressedImage","AutoButtonColor"},
+    TextLabel    = {"Text","Font","TextSize","TextScaled","TextColor3","TextTransparency",
+                    "TextStrokeColor3","TextStrokeTransparency","TextWrapped",
+                    "TextXAlignment","TextYAlignment","RichText","LineHeight"},
+    TextButton   = {"Text","Font","TextSize","TextScaled","TextColor3","TextTransparency",
+                    "TextWrapped","TextXAlignment","TextYAlignment","RichText","AutoButtonColor","Selected"},
+    TextBox      = {"Text","Font","TextSize","TextColor3","TextTransparency",
+                    "TextWrapped","PlaceholderText","PlaceholderColor3","ClearTextOnFocus","MultiLine"},
+    ViewportFrame= {"ImageTransparency","ImageColor3","Ambient","LightColor","LightDirection"},
+    UICorner     = {"CornerRadius"},
+    UIStroke     = {"Name","Color","Thickness","Transparency","ApplyStrokeMode","Enabled","LineJoinMode"},
+    UIGradient   = {"Color","Transparency","Rotation","Offset","Enabled"},
+    UIListLayout = {"SortOrder","FillDirection","HorizontalAlignment","VerticalAlignment","Padding","ItemLineAlignment"},
+    UIPadding    = {"PaddingTop","PaddingRight","PaddingBottom","PaddingLeft"},
+    UIScale      = {"Scale"},
+    UIAspectRatioConstraint = {"AspectRatio","AspectType","DominantAxis"},
+    UISizeConstraint        = {"MinSize","MaxSize"},
+    UITextSizeConstraint    = {"MinTextSize","MaxTextSize"},
+}
+local IS_GUI_OBJECT = {
+    Frame=true,CanvasGroup=true,ScrollingFrame=true,
+    ImageLabel=true,ImageButton=true,TextLabel=true,
+    TextButton=true,TextBox=true,ViewportFrame=true,
+}
+local SERIALIZE = {}; for k in _pairs(CLASS_PROPS) do SERIALIZE[k]=true end
+
+local DEFAULTS = {
+    AnchorPoint=Vector2.new(0,0), BackgroundColor3=Color3.fromRGB(255,255,255),
+    BackgroundTransparency=0, BorderSizePixel=1, Visible=true, ZIndex=1,
+    ClipsDescendants=false, Active=false, LayoutOrder=0, Rotation=0,
+    ResetOnSpawn=true, Enabled=true, IgnoreGuiInset=false, DisplayOrder=0,
+    TextTransparency=0, TextStrokeColor3=Color3.fromRGB(0,0,0), TextStrokeTransparency=1,
+    TextColor3=Color3.fromRGB(26,26,26), TextScaled=false, TextWrapped=false,
+    RichText=false, LineHeight=1, ImageTransparency=0, ImageColor3=Color3.fromRGB(255,255,255),
+    Thickness=1, Transparency=0, Offset=Vector2.new(0,0), Scale=1,
+    AutoButtonColor=true, ClearTextOnFocus=true, MultiLine=false, Selected=false,
+    ScrollBarThickness=12, ScrollBarImageTransparency=0, ScrollingEnabled=true,
+    GroupTransparency=0, GroupColor3=Color3.fromRGB(255,255,255), AspectRatio=1,
+    PlaceholderColor3=Color3.fromRGB(178,178,178),
+    Padding=UDim.new(0,0), PaddingTop=UDim.new(0,0), PaddingRight=UDim.new(0,0),
+    PaddingBottom=UDim.new(0,0), PaddingLeft=UDim.new(0,0),
+}
+
+local function valEq(a,b)
+    if a==b then return true end
+    local ta=_typeof(a); if ta~=_typeof(b) then return false end
+    if ta=="Color3" then
+        return _floor(a.R*255+.5)==_floor(b.R*255+.5)
+           and _floor(a.G*255+.5)==_floor(b.G*255+.5)
+           and _floor(a.B*255+.5)==_floor(b.B*255+.5)
+    elseif ta=="UDim2" then
+        return rnd(a.X.Scale,5)==rnd(b.X.Scale,5) and _floor(a.X.Offset+.5)==_floor(b.X.Offset+.5)
+           and rnd(a.Y.Scale,5)==rnd(b.Y.Scale,5) and _floor(a.Y.Offset+.5)==_floor(b.Y.Offset+.5)
+    elseif ta=="UDim" then
+        return rnd(a.Scale,5)==rnd(b.Scale,5) and _floor(a.Offset+.5)==_floor(b.Offset+.5)
+    elseif ta=="Vector2" then
+        return rnd(a.X,5)==rnd(b.X,5) and rnd(a.Y,5)==rnd(b.Y,5)
+    elseif ta=="EnumItem" then return _tostr(a)==_tostr(b) end
+    local ok1,s1=_pcall(_tostr,a); local ok2,s2=_pcall(_tostr,b)
+    return ok1 and ok2 and s1==s2
+end
+
+local function propsFor(cn)
+    local props,seen={},{}
+    local function add(lst) for _,p in _ipairs(lst) do if not seen[p] then seen[p]=true;_ins(props,p) end end end
+    if IS_GUI_OBJECT[cn] then add(GUI_BASE) end
+    if cn=="ScreenGui"   then add({"Name"}) end
+    add(CLASS_PROPS[cn] or {})
+    if cn=="TextButton"  then add(CLASS_PROPS["TextLabel"] or {}) end
+    return props
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SERIALIZACIÓN DE INSTANCIAS
+-- ─────────────────────────────────────────────────────────────────────────────
+local function makeVar(nm, cn, counters)
+    local base = nm:gsub("[^%w]","_")
+    if base=="" or base:match("^%d") then base=cn.."_"..base end
+    if base=="" then base=cn end
+    counters[base]=(counters[base] or 0)+1
+    return base.."_"..counters[base]
+end
+
+local function serInst(inst, parentVar, depth, lines, counters)
+    if CFG.MAX_DEPTH>0 and depth>CFG.MAX_DEPTH then return lines,nil end
+    local cn=safeClass(inst)
+    if cn=="" or not SERIALIZE[cn] then return lines,nil end
+    local nm=safeName(inst)
+
+    -- Saltar interior de tabs si está configurado
+    if CFG.SKIP_TABS and nm:find("^TabFrame_") then
+        _ins(lines,_fmt('%s-- [OMITIDO] TabFrame "%s"',_rep("    ",depth),nm))
+        _ins(lines,""); return lines,nil
+    end
+
+    local var=makeVar(nm,cn,counters)
+    local ind=_rep("    ",depth)
+
+    _ins(lines,_fmt('%s-- [%s] %q',ind,cn,nm))
+    _ins(lines,_fmt('%slocal %s = Instance.new("%s")',ind,var,cn))
+
+    local props=propsFor(cn)
+    for _,prop in _ipairs(props) do
+        local ok,val=safeProp(inst,prop)
+        if ok and val~=nil then
+            local forced=CFG.FORCE_PROPS[prop]
+            local def=DEFAULTS[prop]
+            if forced or (def==nil) or (not valEq(val,def)) then
+                if not forced and (prop=="Position" or prop=="Size")
+                    and _typeof(val)=="UDim2"
+                    and val.X.Scale==0 and val.X.Offset==0
+                    and val.Y.Scale==0 and val.Y.Offset==0 then
+                    -- skip zero-UDim2 no forzado
+                else
+                    local sv=serVal(val)
+                    if sv and sv~="nil" then
+                        _ins(lines,_fmt('%s%s.%s = %s',ind,var,prop,sv))
+                    end
+                end
+            end
+        end
+    end
+
+    if parentVar then _ins(lines,_fmt('%s%s.Parent = %s',ind,var,parentVar)) end
+    _ins(lines,"")
+
+    for _,child in _ipairs(safeChildren(inst)) do
+        serInst(child,var,depth+1,lines,counters)
+    end
+    return lines,var
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- GENERACIÓN DEL CÓDIGO FINAL
+-- ─────────────────────────────────────────────────────────────────────────────
+local function buildCode(roots)
+    local L={}
+    _ins(L,'--[[\n  BKS HUB — GUI Original (BKS_GUI_EXTRACTOR_v3)')
+    _ins(L,'  Generado: '.._tostr(tick()))
+    _ins(L,'  Instancias reales extraídas de PlayerGui/CoreGui en runtime.\n--]]')
+    _ins(L,'')
+    _ins(L,'local Players = game:GetService("Players")')
+    _ins(L,'local UIS     = game:GetService("UserInputService")')
+    _ins(L,'local LP      = Players.LocalPlayer')
+    _ins(L,'local PG      = LP:WaitForChild("PlayerGui")')
+    _ins(L,'')
+    -- Limpiar GUIs anteriores
+    local allNames = {'"'.._cat(CFG.SGUI_EXTRAS,'" , "')}
+    _ins(L,'-- Limpiar instancias anteriores')
+    _ins(L,'for _, nm in ipairs({"'.._cat({CFG.SGUI_MAIN, table.unpack(CFG.SGUI_EXTRAS)},'","')}..'"}) do')
+    _ins(L,'    local old = PG:FindFirstChild(nm)')
+    _ins(L,'    if old then old:Destroy() end')
+    _ins(L,'end')
+    _ins(L,'')
+    _ins(L,'-- ══════════════════════════════════════════')
+    _ins(L,'-- GUI ORIGINAL')
+    _ins(L,'-- ══════════════════════════════════════════')
+    _ins(L,'')
+
+    local counters={}
+    local firstVar=nil
+    for _,root in _ipairs(roots) do
+        local rlines,rvar=serInst(root,"PG",0,{},counters)
+        if rvar and not firstVar then firstVar=rvar end
+        for _,l in _ipairs(rlines) do _ins(L,l) end
+    end
+
+    _ins(L,'')
+    _ins(L,'-- ══════════════════════════════════════════')
+    _ins(L,'-- KEYBIND TOGGLE (U = mostrar/ocultar)')
+    _ins(L,'-- ══════════════════════════════════════════')
+    if firstVar then
+        _ins(L,'local _sg = '..firstVar)
+        _ins(L,'UIS.InputBegan:Connect(function(inp,gpe)')
+        _ins(L,'    if gpe then return end')
+        _ins(L,'    if inp.KeyCode == Enum.KeyCode.U then')
+        _ins(L,'        _sg.Enabled = not _sg.Enabled')
+        _ins(L,'    end')
+        _ins(L,'end)')
+    end
+    _ins(L,'')
+    _ins(L,'print("[BKS GUI v3] Cargada.")')
+    return _cat(L,"\n")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ESPERAR ESTABILIZACIÓN DE LA GUI
+-- Cuenta descendientes cada STABLE_INTERVAL segundos.
+-- Cuando el count no cambia en STABLE_CHECKS checks → GUI lista.
+-- ─────────────────────────────────────────────────────────────────────────────
+local function waitStable(inst)
+    local prev    = -1
+    local sameRun = 0
+    local t0      = tick()
+
+    print(_fmt("[BKS GE] Esperando estabilización de %s...", safeName(inst)))
+
+    while (tick()-t0) < CFG.STABLE_TIMEOUT do
+        task.wait(CFG.STABLE_INTERVAL)
+        local count = safeDescCount(inst)
+        if count == prev then
+            sameRun = sameRun + 1
+            print(_fmt("[BKS GE]   stable %d/%d (desc=%d)",
+                sameRun, CFG.STABLE_CHECKS, count))
+            if sameRun >= CFG.STABLE_CHECKS then
+                print(_fmt("[BKS GE] GUI estable con %d descendientes.", count))
+                return true
+            end
+        else
+            if prev ~= -1 then
+                print(_fmt("[BKS GE]   creciendo: %d → %d", prev, count))
+            end
+            sameRun = 0
+            prev    = count
+        end
+    end
+
+    print("[BKS GE] Timeout de estabilización — capturando de todas formas.")
+    return false
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BÚSQUEDA DE RAÍCES GUI
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Busca UNA ScreenGui por nombre exacto en PlayerGui y CoreGui
+local function findExact(name)
+    local ok, inst = _pcall(function() return PlayerGui:FindFirstChild(name) end)
+    if ok and inst then return inst end
+    ok, inst = _pcall(function() return CoreGuiSvc:FindFirstChild(name) end)
+    if ok and inst then return inst end
+    return nil
+end
+
+-- Busca TODAS las ScreenGui con prefijo _zk (para captura manual F8)
+local function findAllZk()
+    local roots = {}
+    local seen  = {}
+    local function tryAdd(container)
+        local ok, children = _pcall(function() return container:GetChildren() end)
+        if not ok then return end
+        for _, c in _ipairs(children) do
+            local cn=safeClass(c); local nm=safeName(c)
+            if cn=="ScreenGui" and nm:sub(1,3)=="_zk" and not seen[nm] then
+                seen[nm]=true; _ins(roots,c)
+            end
+        end
+    end
+    tryAdd(PlayerGui)
+    tryAdd(CoreGuiSvc)
+    return roots
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- GUARDADO
+-- ─────────────────────────────────────────────────────────────────────────────
+local function clipSave(text)
+    if not CFG.SAVE_CLIPBOARD then return false end
+    local ok=_pcall(setclipboard,text); if ok then return true end
+    ok=_pcall(function() Clipboard:SetText(text) end); return ok
+end
+
+local function pasteSave(text, service, url, body, headers)
+    if not CFG.SAVE_HASTEBIN then return nil end
+    local ok,res=_pcall(function()
+        return request({Url=url,Method="POST",Body=body,Headers=headers})
+    end)
+    if not ok or not res or not res.Body then return nil end
+    local ok2,data=_pcall(function() return HttpSvc:JSONDecode(res.Body) end)
+    if ok2 and data then
+        if data.key  then return "https://hastebin.com/"..data.key end
+        if data.url  then return data.url.."/raw" end
+    end
+    return nil
+end
+
+local function hasteSave(text)
+    return pasteSave(text,"hastebin","https://hastebin.com/documents",text,{["Content-Type"]="text/plain"})
+end
+local function rentrySave(text)
+    return pasteSave(text,"rentry","https://rentry.co/api",
+        "text="..HttpSvc:UrlEncode(text),
+        {["Content-Type"]="application/x-www-form-urlencoded",["Referer"]="https://rentry.co"})
+end
+
+local function chunkPrint(text)
+    if not CFG.PRINT_CHUNKS then return end
+    local CHUNK=3500
+    for i=1,#text,CHUNK do print(text:sub(i,i+CHUNK-1)); task.wait(0.05) end
+    print("[BKS GE] ── FIN ──")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NOTIFICACIÓN
+-- ─────────────────────────────────────────────────────────────────────────────
+local function notify(title, msg, dur)
+    _pcall(function()
+        StarterGuiSvc:SetCore("SendNotification",{Title=title,Text=msg,Duration=dur or 5})
+    end)
+    print("[BKS GE] "..title.." — "..msg)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- GUARDAR Y REPORTAR
+-- ─────────────────────────────────────────────────────────────────────────────
+local function saveAndReport(code)
+    local bytes=#code
+    local lines=select(2,code:gsub("\n",""))+1
+    print(_fmt("[BKS GE] Output: %d líneas, %.1f KB",lines,bytes/1024))
+
+    local saved=false; local url=nil
+
+    if bytes>80000 then
+        notify("BKS GE",_fmt("%.0f KB — subiendo...",bytes/1024),5)
+        url=hasteSave(code) or rentrySave(code)
+        if url then saved=true; clipSave(url); notify("BKS GE","✓ URL: "..url,15); print("[BKS GE] URL: "..url) end
+    end
+
+    if not saved then
+        local ok=clipSave(code)
+        if ok then saved=true; notify("BKS GE",_fmt("✓ En clipboard (%.0f KB).",bytes/1024),8) end
+        -- también subir aunque haya clipboard (backup)
+        if CFG.SAVE_HASTEBIN and not url then
+            url=hasteSave(code) or rentrySave(code)
+            if url then print("[BKS GE] Backup URL: "..url); notify("BKS GE","Backup: "..url,10) end
+        end
+    end
+
+    if not saved then
+        notify("BKS GE","Clipboard falló. Imprimiendo chunks...",5)
+        chunkPrint(code)
+    else
+        chunkPrint(code) -- siempre imprimir como backup adicional
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- EXTRACCIÓN DESDE UN CONJUNTO DE RAÍCES
+-- ─────────────────────────────────────────────────────────────────────────────
+local extractionDone=false
+
+local function doExtractRoots(roots, source)
+    if #roots==0 then
+        notify("BKS GE","⚠ No hay ScreenGui _zk* en PlayerGui/CoreGui.",8)
+        return
+    end
+    notify("BKS GE",_fmt("%d ScreenGui encontradas. Serializando... (%s)",#roots,source),5)
+    local code=buildCode(roots)
+    saveAndReport(code)
+    extractionDone=true
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- EXTRACCIÓN AUTOMÁTICA: busca _zk768057 exacto, espera estabilización
+-- ─────────────────────────────────────────────────────────────────────────────
+local function autoExtract()
+    -- 1. Esperar a que aparezca la GUI principal exacta
+    local t0=tick()
+    local mainGui=nil
+
+    notify("BKS GE","Esperando _zk768057...",6)
+
+    while (tick()-t0) < CFG.DETECT_TIMEOUT do
+        mainGui = findExact(CFG.SGUI_MAIN)
+        if mainGui then break end
+        task.wait(0.5)
+    end
+
+    if not mainGui then
+        notify("BKS GE",
+            _fmt("Timeout (%ds). _zk768057 no apareció.\nPresiona F8 para capturar lo que haya.",
+                CFG.DETECT_TIMEOUT), 12)
+        return
+    end
+
+    notify("BKS GE","_zk768057 detectada. Esperando que buildGUI() termine...",5)
+
+    -- 2. Esperar estabilización (buildGUI puede tardar ~10s)
+    waitStable(mainGui)
+
+    -- 3. Recolectar: main + extras
+    local roots={}
+    _ins(roots, mainGui)
+    for _,nm in _ipairs(CFG.SGUI_EXTRAS) do
+        local inst=findExact(nm)
+        if inst then _ins(roots,inst) end
+    end
+
+    doExtractRoots(roots,"auto-detect")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- KEYBIND F8: captura inmediata de todas las _zk* ScreenGui
+-- ─────────────────────────────────────────────────────────────────────────────
+UIS.InputBegan:Connect(function(inp,gpe)
+    if gpe then return end
+    if inp.UserInputType==Enum.UserInputType.Keyboard and inp.KeyCode==CFG.MANUAL_KEY then
+        task.spawn(function()
+            notify("BKS GE","F8 → capturando AHORA todas las _zk* ScreenGui...",4)
+            local roots=findAllZk()
+            if #roots==0 then
+                notify("BKS GE","No hay ScreenGui _zk* en este momento. Espera a que el hub cargue.",7)
+                return
+            end
+            -- Informar qué se capturará
+            local names={}
+            for _,r in _ipairs(roots) do _ins(names,safeName(r)) end
+            print("[BKS GE] F8 → capturando: ".._cat(names,", "))
+            doExtractRoots(roots,"F8 manual")
+        end)
+    end
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ENTRY POINT
+-- ─────────────────────────────────────────────────────────────────────────────
+notify("BKS GE","v3 listo! F8 = capturar ahora.",6)
+print("[BKS GE] Busca exactamente: "..(CFG.SGUI_MAIN))
+print("[BKS GE] F8 captura TODAS las _zk* ScreenGui presentes.")
+
+if CFG.WAIT_FOR_HUB then
+    task.spawn(autoExtract)
+else
+    task.spawn(function()
+        task.wait(0.5)
+        local roots=findAllZk()
+        doExtractRoots(roots,"inmediato")
+    end)
+end
