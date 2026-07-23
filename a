@@ -1,26 +1,22 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║   BKS HUB — GUI EXTRACTOR v1                                                ║
+║   BKS HUB — GUI EXTRACTOR v2                                                ║
 ║                                                                              ║
-║   OBJETIVO: Extraer la GUI ORIGINAL del hub con colores, gradientes,        ║
-║             animaciones y propiedades exactas tal como las crea buildGUI()  ║
+║   MEJORAS vs v1:                                                             ║
+║   • Fallback de typeof() para executors que no lo exponen                   ║
+║   • Hook de Instance.new → captura instancias MIENTRAS se crean             ║
+║     (funciona aunque el hub crashee a mitad de buildGUI)                    ║
+║   • Tecla F8 = capturar manualmente en cualquier momento                    ║
+║   • Doble estrategia: snapshot del árbol + instancias hookeadas             ║
+║   • Manejo robusto de pcall en CADA lectura de propiedad                    ║
 ║                                                                              ║
-║   MECANISMO:                                                                 ║
-║   1. Espera a que el hub cargue y construya la GUI (_zk768057)               ║
-║   2. Traversa el árbol de instancias REAL en PlayerGui/CoreGui               ║
-║   3. Serializa CADA propiedad visual exacta (Color3, UDim2, gradientes...)   ║
-║   4. Genera código Lua limpio que reproduce el GUI idéntico                  ║
-║   5. Guarda via clipboard y/o hastebin                                       ║
-║                                                                              ║
-║   USO (modo auto):                                                           ║
-║   1. Ejecutar ESTE script antes de cargar el hub                             ║
-║   2. Cargar el hub normalmente                                               ║
-║   3. Esperar notificación "✓ GUI Capturada"                                  ║
-║   4. El resultado está en clipboard                                          ║
-║                                                                              ║
-║   USO (hub ya cargado):                                                      ║
-║   1. Cambiar WAIT_FOR_HUB = false                                            ║
-║   2. Ejecutar → captura inmediata                                            ║
+║   USO:                                                                       ║
+║   1. Ejecutar ESTE script PRIMERO (antes del hub)                            ║
+║   2. Cargar el hub (aunque crashee, el hook ya capturó las instancias)       ║
+║   3. Presionar F8 para capturar manualmente                                  ║
+║      ─── O ───                                                               ║
+║      Esperar la notificación automática si el hub cargó bien                ║
+║   4. Resultado en clipboard / hastebin / consola                             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 --]]
 
@@ -28,40 +24,50 @@
 -- CONFIGURACIÓN
 -- ─────────────────────────────────────────────────────────────────────────────
 local CFG = {
-    WAIT_FOR_HUB   = true,     -- true = esperar hub | false = captura inmediata
-    TIMEOUT        = 90,       -- segundos máximos de espera
-    WAIT_EXTRA     = 1.5,      -- segundos extra tras detectar GUI (buildGUI puede tardar)
+    -- Modo de espera
+    WAIT_FOR_HUB   = true,   -- true = esperar auto | false = capturar YA
+    TIMEOUT        = 120,    -- segundos máximos esperando
+    WAIT_EXTRA     = 2.0,    -- segundos extra tras detectar GUI
 
-    -- Nombres de ScreenGui conocidos del hub
-    SGUI_MAIN      = "_zk768057",
-    SGUI_OVERLAY   = "_zkOverlay_876775",
-    SGUI_OPENBTN   = "_zkOpenBtn",
+    -- Tecla manual para forzar captura en cualquier momento
+    MANUAL_KEY     = Enum.KeyCode.F8,
+
+    -- ScreenGui del hub
+    SGUI_NAMES     = { "_zk768057", "_zkOverlay_876775", "_zkOpenBtn" },
+    -- Prefijo para buscar por fallback
+    SGUI_PREFIX    = "_zk",
 
     -- Output
-    SAVE_CLIPBOARD = true,     -- guardar código en clipboard
-    SAVE_HASTEBIN  = true,     -- intentar subir a hastebin (usa request)
-    PRINT_CHUNKS   = true,     -- imprimir en consola si clipboard falla
+    SAVE_CLIPBOARD = true,
+    SAVE_HASTEBIN  = true,   -- usa request()
+    PRINT_CHUNKS   = true,   -- print en consola si todo lo demás falla
 
-    -- Alcance de la extracción
-    SKIP_TABS_CONTENT = false, -- false = incluir interior de cada tab | true = solo shell
-    MAX_DEPTH         = 0,     -- 0 = sin límite. Ej: 6 para cortar ramas muy profundas
+    -- Extracción
+    SKIP_TABS      = false,  -- true = omitir interior de tabs (output más pequeño)
+    MAX_DEPTH      = 0,      -- 0 = sin límite
 
-    -- Propiedades que SIEMPRE se serializar (aunque sean default)
-    FORCE_PROPS = { "Name", "Size", "Position", "Text", "Image", "CornerRadius" },
+    FORCE_PROPS    = {
+        Name=true, Size=true, Position=true,
+        Text=true, Image=true, CornerRadius=true,
+    },
 }
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- SERVICIOS Y REFERENCIAS
+-- SERVICIOS (guardar refs antes de cualquier hook)
 -- ─────────────────────────────────────────────────────────────────────────────
 local Players           = game:GetService("Players")
-local CoreGui           = game:GetService("CoreGui")
-local StarterGui        = game:GetService("StarterGui")
+local CoreGuiSvc        = game:GetService("CoreGui")
+local StarterGuiSvc     = game:GetService("StarterGui")
+local UIS               = game:GetService("UserInputService")
+local HttpSvc           = game:GetService("HttpService")
 local LocalPlayer       = Players.LocalPlayer
 local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui", 30)
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REFERENCIAS LOCALES (capturar antes de cualquier hook)
+-- ─────────────────────────────────────────────────────────────────────────────
 local _pcall   = pcall
 local _type    = type
-local _typeof  = typeof  -- typeof() es nativo de Roblox/Luau
 local _tostr   = tostring
 local _pairs   = pairs
 local _ipairs  = ipairs
@@ -71,13 +77,69 @@ local _fmt     = string.format
 local _rep     = string.rep
 local _floor   = math.floor
 local _abs     = math.abs
+local _max     = math.max
+local _min     = math.min
+
+-- typeof() puede no estar disponible como global en algunos executors
+-- (aunque es nativo de Luau/Roblox, algunos sandboxes lo ocultan)
+local _typeof
+do
+    local ok, tf = _pcall(function() return typeof end)
+    if ok and _type(tf) == "function" then
+        _typeof = tf
+    else
+        -- Fallback: usar ClassName para userdata de Roblox
+        _typeof = function(v)
+            local t = _type(v)
+            if t ~= "userdata" then return t end
+            -- Intentar leer ClassName (funciona para Instances y DataTypes)
+            local ok2, cn = _pcall(function() return v.ClassName end)
+            if ok2 and cn then
+                -- Distinguir tipos de datos Roblox por sus propiedades únicas
+                if _pcall(function() local _ = v.R + v.G + v.B end) then return "Color3" end
+                if _pcall(function() local _ = v.X.Scale + v.Y.Scale end) then return "UDim2" end
+                if _pcall(function() local _ = v.Scale + v.Offset end) then return "UDim" end
+                if _pcall(function() local _ = v.Keypoints[1].Time end) then
+                    if _pcall(function() local _ = v.Keypoints[1].Value.R end) then
+                        return "ColorSequence"
+                    end
+                    return "NumberSequence"
+                end
+                if _pcall(function() local _ = v.EnumType end) then return "EnumItem" end
+                -- Si tiene ClassName, es una Instance
+                return cn  -- devuelve ClassName como tipo
+            end
+            -- Vector2: X e Y pero sin Scale/Offset
+            if _pcall(function() local _ = v.X + v.Y end) then return "Vector2" end
+            return "userdata"
+        end
+    end
+end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- SERIALIZADORES DE TIPOS ROBLOX
+-- UTILIDAD: leer propiedad de forma segura
+-- ─────────────────────────────────────────────────────────────────────────────
+local function safeProp(inst, prop)
+    local ok, val = _pcall(function() return inst[prop] end)
+    return ok, val
+end
+
+local function safeClassName(inst)
+    local ok, cn = _pcall(function() return inst.ClassName end)
+    return ok and cn or ""
+end
+
+local function safeName(inst)
+    local ok, n = _pcall(function() return inst.Name end)
+    return ok and n or ""
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- SERIALIZADORES
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local function rnd(n, decimals)
-    local f = 10 ^ (decimals or 4)
+local function rnd(n, d)
+    local f = 10 ^ (d or 4)
     return _floor(n * f + 0.5) / f
 end
 
@@ -85,63 +147,53 @@ local function serNum(n)
     if n == _floor(n) and _abs(n) < 1e7 then
         return _tostr(_floor(n))
     end
-    local s = _fmt("%.6f", n):gsub("%.?0+$", "")
-    return s
+    local s = _fmt("%.6f", n)
+    s = s:gsub("%.?0+$", "")
+    return s == "" and "0" or s
 end
 
-local function serColor3(c)
-    local r = _floor(c.R * 255 + 0.5)
-    local g = _floor(c.G * 255 + 0.5)
-    local b = _floor(c.B * 255 + 0.5)
+local function serStr(s)
+    return '"' .. _tostr(s)
+        :gsub("\\","\\\\")
+        :gsub('"','\\"')
+        :gsub("\n","\\n")
+        :gsub("\r","\\r")
+        :gsub("\t","\\t") .. '"'
+end
+
+local function serC3(c)
+    local r = _floor(c.R * 255 + .5)
+    local g = _floor(c.G * 255 + .5)
+    local b = _floor(c.B * 255 + .5)
     return _fmt("Color3.fromRGB(%d, %d, %d)", r, g, b)
 end
 
 local function serUDim2(u)
-    local xs = rnd(u.X.Scale, 5)
-    local xo = _floor(u.X.Offset + 0.5)
-    local ys = rnd(u.Y.Scale, 5)
-    local yo = _floor(u.Y.Offset + 0.5)
-    return _fmt("UDim2.new(%s, %d, %s, %d)", _tostr(xs), xo, _tostr(ys), yo)
+    return _fmt("UDim2.new(%s, %d, %s, %d)",
+        _tostr(rnd(u.X.Scale,5)), _floor(u.X.Offset+.5),
+        _tostr(rnd(u.Y.Scale,5)), _floor(u.Y.Offset+.5))
 end
 
 local function serUDim(u)
-    local s = rnd(u.Scale, 5)
-    local o = _floor(u.Offset + 0.5)
-    return _fmt("UDim.new(%s, %d)", _tostr(s), o)
+    return _fmt("UDim.new(%s, %d)", _tostr(rnd(u.Scale,5)), _floor(u.Offset+.5))
 end
 
-local function serVector2(v)
+local function serV2(v)
     return _fmt("Vector2.new(%s, %s)", serNum(v.X), serNum(v.Y))
 end
 
-local function serEnum(e)
-    -- En Roblox, tostring(Enum.Font.Gotham) → "Enum.Font.Gotham"
-    local ok, s = _pcall(_tostr, e)
-    return ok and s or "nil"
-end
-
-local function serString(s)
-    -- Escapar comillas dobles, backslashes y saltos de línea
-    local esc = s:gsub("\\", "\\\\")
-                 :gsub('"',  '\\"')
-                 :gsub("\n", "\\n")
-                 :gsub("\r", "\\r")
-                 :gsub("\t", "\\t")
-    return '"' .. esc .. '"'
-end
-
-local function serColorSequence(cs)
+local function serColorSeq(cs)
     local parts = {}
-    for _, kp in ipairs(cs.Keypoints) do
+    for _, kp in _ipairs(cs.Keypoints) do
         _ins(parts, _fmt("    ColorSequenceKeypoint.new(%s, %s)",
-            serNum(kp.Time), serColor3(kp.Value)))
+            serNum(kp.Time), serC3(kp.Value)))
     end
     return "ColorSequence.new({\n" .. _cat(parts, ",\n") .. "\n})"
 end
 
-local function serNumberSequence(ns)
+local function serNumSeq(ns)
     local parts = {}
-    for _, kp in ipairs(ns.Keypoints) do
+    for _, kp in _ipairs(ns.Keypoints) do
         _ins(parts, _fmt("    NumberSequenceKeypoint.new(%s, %s, %s)",
             serNum(kp.Time), serNum(kp.Value), serNum(kp.Envelope)))
     end
@@ -154,544 +206,305 @@ local function serRect(r)
         serNum(r.Max.X), serNum(r.Max.Y))
 end
 
--- Serializa cualquier valor Roblox → código Lua string
-local function serValue(val)
+-- Serializa cualquier valor Roblox → Lua string
+local function serVal(val)
     local t = _typeof(val)
     if t == "nil"             then return "nil"
     elseif t == "boolean"     then return _tostr(val)
     elseif t == "number"      then return serNum(val)
-    elseif t == "string"      then return serString(val)
-    elseif t == "Color3"      then return serColor3(val)
+    elseif t == "string"      then return serStr(val)
+    elseif t == "Color3"      then return serC3(val)
     elseif t == "UDim2"       then return serUDim2(val)
     elseif t == "UDim"        then return serUDim(val)
-    elseif t == "Vector2"     then return serVector2(val)
-    elseif t == "ColorSequence"   then return serColorSequence(val)
-    elseif t == "NumberSequence"  then return serNumberSequence(val)
-    elseif t == "Rect"            then return serRect(val)
-    elseif t == "EnumItem"        then return serEnum(val)
-    elseif t == "BrickColor"      then
-        return _fmt('BrickColor.new("%s")', _tostr(val))
-    elseif t == "Font" then
-        -- Roblox Font object (nuevo sistema de fuentes)
-        local ok, s = _pcall(function()
-            return _fmt('Font.fromEnum(Enum.Font.%s)', _tostr(val.Family))
-        end)
-        return ok and s or serString(_tostr(val))
-    else
-        -- Último recurso: tostring (funciona para Instances → evitar referencias)
+    elseif t == "Vector2"     then return serV2(val)
+    elseif t == "ColorSequence"  then return serColorSeq(val)
+    elseif t == "NumberSequence" then return serNumSeq(val)
+    elseif t == "Rect"           then return serRect(val)
+    elseif t == "EnumItem"    then
         local ok, s = _pcall(_tostr, val)
-        if ok and s and s ~= "" then return serString(s) end
+        return ok and s or "nil"
+    elseif t == "BrickColor"  then
+        local ok, s = _pcall(_tostr, val)
+        return ok and _fmt('BrickColor.new("%s")', s) or "nil"
+    else
+        -- Para tipos desconocidos, intentar tostring
+        local ok, s = _pcall(_tostr, val)
+        if ok and s and s ~= "" and s ~= "nil" then return serStr(s) end
         return "nil"
     end
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- DEFINICIÓN DE PROPIEDADES POR CLASE
+-- PROPIEDADES POR CLASE
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Propiedades base de GuiObject (todos los elementos visuales)
-local GUI_OBJECT_PROPS = {
-    "Name",
-    "Size", "Position", "AnchorPoint",
-    "BackgroundColor3", "BackgroundTransparency",
-    "BorderSizePixel",
-    "Visible", "ZIndex",
-    "ClipsDescendants", "Active",
-    "AutomaticSize", "LayoutOrder",
-    "SizeConstraint", "SelectionGroup",
-    "Rotation",
+local GUI_BASE = {
+    "Name","Size","Position","AnchorPoint",
+    "BackgroundColor3","BackgroundTransparency",
+    "BorderSizePixel","Visible","ZIndex",
+    "ClipsDescendants","Active","AutomaticSize",
+    "LayoutOrder","Rotation",
 }
-
--- Propiedades por clase específica
 local CLASS_PROPS = {
-    ScreenGui = {
-        "ResetOnSpawn", "Enabled", "ZIndexBehavior",
-        "IgnoreGuiInset", "DisplayOrder",
-    },
-    Frame         = {},
-    CanvasGroup   = { "GroupTransparency", "GroupColor3" },
+    ScreenGui    = {"Name","ResetOnSpawn","Enabled","ZIndexBehavior","IgnoreGuiInset","DisplayOrder"},
+    Frame        = {},
+    CanvasGroup  = {"GroupTransparency","GroupColor3"},
     ScrollingFrame = {
-        "ScrollBarThickness", "ScrollBarImageColor3",
-        "ScrollBarImageTransparency", "CanvasSize",
-        "AutomaticCanvasSize", "ScrollingDirection",
-        "VerticalScrollBarInset", "HorizontalScrollBarInset",
-        "ScrollingEnabled", "ElasticBehavior",
+        "ScrollBarThickness","ScrollBarImageColor3","ScrollBarImageTransparency",
+        "CanvasSize","AutomaticCanvasSize","ScrollingDirection",
+        "VerticalScrollBarInset","HorizontalScrollBarInset","ScrollingEnabled",
     },
-    ImageLabel = {
-        "Image", "ImageColor3", "ImageTransparency",
-        "ScaleType", "TileSize", "SliceCenter", "SliceScale",
-        "ResampleMode",
-    },
-    ImageButton = {
-        "Image", "ImageColor3", "ImageTransparency",
-        "ScaleType", "TileSize", "SliceCenter", "SliceScale",
-        "HoverImage", "PressedImage", "AutoButtonColor",
-    },
-    TextLabel = {
-        "Text", "Font",
-        "TextSize", "TextScaled", "TextColor3",
-        "TextTransparency", "TextStrokeColor3", "TextStrokeTransparency",
-        "TextWrapped", "TextXAlignment", "TextYAlignment",
-        "RichText", "LineHeight",
-    },
-    TextButton = {
-        "Text", "Font",
-        "TextSize", "TextScaled", "TextColor3",
-        "TextTransparency", "TextStrokeColor3", "TextStrokeTransparency",
-        "TextWrapped", "TextXAlignment", "TextYAlignment",
-        "RichText", "AutoButtonColor", "Selected",
-    },
-    TextBox = {
-        "Text", "Font",
-        "TextSize", "TextScaled", "TextColor3",
-        "TextTransparency", "TextWrapped",
-        "PlaceholderText", "PlaceholderColor3",
-        "ClearTextOnFocus", "MultiLine",
-    },
-    ViewportFrame = {
-        "ImageTransparency", "ImageColor3",
-        "Ambient", "LightColor", "LightDirection",
-    },
-    -- UI constraints / layout objects (NO heredan GuiObject)
-    UICorner = { "CornerRadius" },
-    UIStroke = {
-        "Name", "Color", "Thickness", "Transparency",
-        "ApplyStrokeMode", "Enabled", "LineJoinMode",
-    },
-    UIGradient = {
-        "Color", "Transparency", "Rotation", "Offset", "Enabled",
-    },
-    UIListLayout = {
-        "SortOrder", "FillDirection", "HorizontalAlignment",
-        "VerticalAlignment", "Padding", "ItemLineAlignment",
-    },
-    UIPadding = {
-        "PaddingTop", "PaddingRight", "PaddingBottom", "PaddingLeft",
-    },
-    UIScale = { "Scale" },
-    UIAspectRatioConstraint = {
-        "AspectRatio", "AspectType", "DominantAxis",
-    },
-    UISizeConstraint = { "MinSize", "MaxSize" },
-    UITextSizeConstraint = { "MinTextSize", "MaxTextSize" },
+    ImageLabel   = {"Image","ImageColor3","ImageTransparency","ScaleType","TileSize","SliceCenter","SliceScale","ResampleMode"},
+    ImageButton  = {"Image","ImageColor3","ImageTransparency","ScaleType","TileSize","HoverImage","PressedImage","AutoButtonColor"},
+    TextLabel    = {"Text","Font","TextSize","TextScaled","TextColor3","TextTransparency","TextStrokeColor3","TextStrokeTransparency","TextWrapped","TextXAlignment","TextYAlignment","RichText","LineHeight"},
+    TextButton   = {"Text","Font","TextSize","TextScaled","TextColor3","TextTransparency","TextWrapped","TextXAlignment","TextYAlignment","RichText","AutoButtonColor","Selected"},
+    TextBox      = {"Text","Font","TextSize","TextColor3","TextTransparency","TextWrapped","PlaceholderText","PlaceholderColor3","ClearTextOnFocus","MultiLine"},
+    ViewportFrame= {"ImageTransparency","ImageColor3","Ambient","LightColor","LightDirection"},
+    UICorner     = {"CornerRadius"},
+    UIStroke     = {"Name","Color","Thickness","Transparency","ApplyStrokeMode","Enabled","LineJoinMode"},
+    UIGradient   = {"Color","Transparency","Rotation","Offset","Enabled"},
+    UIListLayout = {"SortOrder","FillDirection","HorizontalAlignment","VerticalAlignment","Padding","ItemLineAlignment"},
+    UIPadding    = {"PaddingTop","PaddingRight","PaddingBottom","PaddingLeft"},
+    UIScale      = {"Scale"},
+    UIAspectRatioConstraint = {"AspectRatio","AspectType","DominantAxis"},
+    UISizeConstraint        = {"MinSize","MaxSize"},
+    UITextSizeConstraint    = {"MinTextSize","MaxTextSize"},
 }
-
--- Clases que heredan GuiObject base
 local IS_GUI_OBJECT = {
-    Frame=true, CanvasGroup=true, ScrollingFrame=true,
-    ImageLabel=true, ImageButton=true,
-    TextLabel=true, TextButton=true, TextBox=true,
-    ViewportFrame=true,
+    Frame=true,CanvasGroup=true,ScrollingFrame=true,
+    ImageLabel=true,ImageButton=true,TextLabel=true,
+    TextButton=true,TextBox=true,ViewportFrame=true,
 }
--- TextButton también tiene props de TextLabel
-local IS_TEXT_BUTTON = { TextButton=true }
+local SERIALIZE = {}
+for k in _pairs(CLASS_PROPS) do SERIALIZE[k] = true end
 
--- Whitelist de clases a serializar
-local SERIALIZE_CLASS = {
-    ScreenGui=true, Frame=true, CanvasGroup=true, ScrollingFrame=true,
-    ImageLabel=true, ImageButton=true, TextLabel=true, TextButton=true,
-    TextBox=true, ViewportFrame=true,
-    UICorner=true, UIStroke=true, UIGradient=true,
-    UIListLayout=true, UIPadding=true, UIScale=true,
-    UIAspectRatioConstraint=true, UISizeConstraint=true, UITextSizeConstraint=true,
-}
-
--- ─────────────────────────────────────────────────────────────────────────────
--- DEFAULTS — si el valor coincide con el default NO se serializa
--- (excepto los que están en CFG.FORCE_PROPS)
--- ─────────────────────────────────────────────────────────────────────────────
 local DEFAULTS = {
-    -- GuiObject
-    Size                  = UDim2.new(0, 0, 0, 0),
-    AnchorPoint           = Vector2.new(0, 0),
-    BackgroundColor3      = Color3.fromRGB(255, 255, 255),
-    BackgroundTransparency= 0,
-    BorderSizePixel       = 1,
-    Visible               = true,
-    ZIndex                = 1,
-    ClipsDescendants      = false,
-    Active                = false,
-    LayoutOrder           = 0,
-    SelectionGroup        = false,
-    Rotation              = 0,
-    -- ScreenGui
-    ResetOnSpawn          = true,
-    Enabled               = true,
-    IgnoreGuiInset        = false,
-    DisplayOrder          = 0,
-    -- Text
-    TextTransparency      = 0,
-    TextStrokeColor3      = Color3.fromRGB(0, 0, 0),
-    TextStrokeTransparency= 1,
-    TextColor3            = Color3.fromRGB(26, 26, 26),
-    TextScaled            = false,
-    TextWrapped           = false,
-    RichText              = false,
-    LineHeight            = 1,
-    -- Image
-    ImageTransparency     = 0,
-    ImageColor3           = Color3.fromRGB(255, 255, 255),
-    -- UIStroke
-    Thickness             = 1,
-    -- UIGradient
-    Offset                = Vector2.new(0, 0),
-    -- UIListLayout
-    Padding               = UDim.new(0, 0),
-    -- UIPadding
-    PaddingTop            = UDim.new(0, 0),
-    PaddingRight          = UDim.new(0, 0),
-    PaddingBottom         = UDim.new(0, 0),
-    PaddingLeft           = UDim.new(0, 0),
-    -- UIScale
-    Scale                 = 1,
-    -- Misc
-    AutoButtonColor       = true,
-    ClearTextOnFocus      = true,
-    MultiLine             = false,
-    Selected              = false,
-    ScrollBarThickness    = 12,
-    ScrollBarImageTransparency = 0,
-    ScrollingEnabled      = true,
-    GroupTransparency     = 0,
-    GroupColor3           = Color3.fromRGB(255, 255, 255),
-    AspectRatio           = 1,
-    PlaceholderColor3     = Color3.fromRGB(178, 178, 178),
+    AnchorPoint=Vector2.new(0,0), BackgroundColor3=Color3.fromRGB(255,255,255),
+    BackgroundTransparency=0, BorderSizePixel=1, Visible=true, ZIndex=1,
+    ClipsDescendants=false, Active=false, LayoutOrder=0, Rotation=0,
+    ResetOnSpawn=true, Enabled=true, IgnoreGuiInset=false, DisplayOrder=0,
+    TextTransparency=0, TextStrokeColor3=Color3.fromRGB(0,0,0), TextStrokeTransparency=1,
+    TextColor3=Color3.fromRGB(26,26,26), TextScaled=false, TextWrapped=false,
+    RichText=false, LineHeight=1, ImageTransparency=0, ImageColor3=Color3.fromRGB(255,255,255),
+    Thickness=1, Transparency=0, Offset=Vector2.new(0,0), Scale=1,
+    AutoButtonColor=true, ClearTextOnFocus=true, MultiLine=false, Selected=false,
+    ScrollBarThickness=12, ScrollBarImageTransparency=0, ScrollingEnabled=true,
+    GroupTransparency=0, GroupColor3=Color3.fromRGB(255,255,255), AspectRatio=1,
+    PlaceholderColor3=Color3.fromRGB(178,178,178),
+    Padding=UDim.new(0,0), PaddingTop=UDim.new(0,0), PaddingRight=UDim.new(0,0),
+    PaddingBottom=UDim.new(0,0), PaddingLeft=UDim.new(0,0),
 }
-
--- Set de props que se FUERZAN siempre
-local FORCE_PROPS_SET = {}
-for _, p in ipairs(CFG.FORCE_PROPS) do FORCE_PROPS_SET[p] = true end
-
--- ─────────────────────────────────────────────────────────────────────────────
--- COMPARACIÓN DE VALORES (para omitir defaults)
--- ─────────────────────────────────────────────────────────────────────────────
 
 local function valEq(a, b)
     if a == b then return true end
     local ta = _typeof(a)
-    local tb = _typeof(b)
-    if ta ~= tb then return false end
+    if ta ~= _typeof(b) then return false end
     if ta == "Color3" then
-        return _floor(a.R*255+.5) == _floor(b.R*255+.5)
-           and _floor(a.G*255+.5) == _floor(b.G*255+.5)
-           and _floor(a.B*255+.5) == _floor(b.B*255+.5)
+        return _floor(a.R*255+.5)==_floor(b.R*255+.5)
+           and _floor(a.G*255+.5)==_floor(b.G*255+.5)
+           and _floor(a.B*255+.5)==_floor(b.B*255+.5)
     elseif ta == "UDim2" then
-        return rnd(a.X.Scale,5) == rnd(b.X.Scale,5)
-           and _floor(a.X.Offset+.5) == _floor(b.X.Offset+.5)
-           and rnd(a.Y.Scale,5) == rnd(b.Y.Scale,5)
-           and _floor(a.Y.Offset+.5) == _floor(b.Y.Offset+.5)
+        return rnd(a.X.Scale,5)==rnd(b.X.Scale,5) and _floor(a.X.Offset+.5)==_floor(b.X.Offset+.5)
+           and rnd(a.Y.Scale,5)==rnd(b.Y.Scale,5) and _floor(a.Y.Offset+.5)==_floor(b.Y.Offset+.5)
     elseif ta == "UDim" then
-        return rnd(a.Scale,5) == rnd(b.Scale,5)
-           and _floor(a.Offset+.5) == _floor(b.Offset+.5)
+        return rnd(a.Scale,5)==rnd(b.Scale,5) and _floor(a.Offset+.5)==_floor(b.Offset+.5)
     elseif ta == "Vector2" then
-        return rnd(a.X,5) == rnd(b.X,5) and rnd(a.Y,5) == rnd(b.Y,5)
+        return rnd(a.X,5)==rnd(b.X,5) and rnd(a.Y,5)==rnd(b.Y,5)
     elseif ta == "EnumItem" then
-        return _tostr(a) == _tostr(b)
+        return _tostr(a)==_tostr(b)
     end
-    -- ColorSequence, NumberSequence → raro tener default; comparar por string
-    local ok1, s1 = _pcall(_tostr, a)
-    local ok2, s2 = _pcall(_tostr, b)
-    return ok1 and ok2 and s1 == s2
+    local ok1,s1 = _pcall(_tostr,a)
+    local ok2,s2 = _pcall(_tostr,b)
+    return ok1 and ok2 and s1==s2
 end
 
--- ─────────────────────────────────────────────────────────────────────────────
--- CONSTRUCTOR DE LISTA DE PROPS PARA UNA CLASE
--- ─────────────────────────────────────────────────────────────────────────────
-
-local function propsForClass(cn)
-    local props = {}
-    local seen  = {}
-    local function add(list)
-        for _, p in ipairs(list) do
-            if not seen[p] then seen[p] = true; _ins(props, p) end
+local function propsFor(cn)
+    local props, seen = {}, {}
+    local function add(lst)
+        for _, p in _ipairs(lst) do
+            if not seen[p] then seen[p]=true; _ins(props,p) end
         end
     end
-    -- GuiObject base para clases visuales
-    if IS_GUI_OBJECT[cn] then add(GUI_OBJECT_PROPS) end
-    -- ScreenGui también usa algunas GuiObject props (Size/Position no aplican)
-    if cn == "ScreenGui" then
-        add({ "Name" })
-    end
-    -- Props específicos de clase
+    if IS_GUI_OBJECT[cn] then add(GUI_BASE) end
+    if cn == "ScreenGui"  then add({"Name"}) end
     add(CLASS_PROPS[cn] or {})
-    -- TextButton también hereda texto de TextLabel
-    if IS_TEXT_BUTTON[cn] then
-        for _, p in ipairs(CLASS_PROPS["TextLabel"] or {}) do
-            if not seen[p] then seen[p] = true; _ins(props, p) end
-        end
-    end
+    if cn == "TextButton" then add(CLASS_PROPS["TextLabel"] or {}) end
     return props
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- SERIALIZER PRINCIPAL
+-- SERIALIZACIÓN DE INSTANCIAS
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Genera un nombre de variable Lua válido y único
-local function makeVarName(instName, cn, counters)
-    local base = instName:gsub("[^%w]", "_")
-    if base == "" or base:match("^%d") then base = cn .. "_" .. base end
-    if base == "" then base = cn end
+local function makeVar(nm, cn, counters)
+    local base = nm:gsub("[^%w]","_")
+    if base=="" or base:match("^%d") then base=cn.."_"..base end
+    if base=="" then base=cn end
     counters[base] = (counters[base] or 0) + 1
     return base .. "_" .. counters[base]
 end
 
--- Serializa un Instance recursivamente
--- Retorna: lista de líneas, varName del root
-local function serInst(inst, parentVar, depth, lines, counters, rootCn)
-    depth    = depth or 0
-    lines    = lines or {}
-    counters = counters or {}
-
+local function serInst(inst, parentVar, depth, lines, counters)
     if CFG.MAX_DEPTH > 0 and depth > CFG.MAX_DEPTH then return lines, nil end
 
-    local cn = ""
-    if not _pcall(function() cn = inst.ClassName end) then return lines, nil end
-    if not SERIALIZE_CLASS[cn] then return lines, nil end
+    local cn = safeClassName(inst)
+    if cn == "" or not SERIALIZE[cn] then return lines, nil end
 
-    -- Nombre del instance
-    local instName = ""
-    _pcall(function() instName = inst.Name end)
+    local nm     = safeName(inst)
+    local var    = makeVar(nm, cn, counters)
+    local ind    = _rep("    ", depth)
 
-    local varName = makeVarName(instName, cn, counters)
-    local ind     = _rep("    ", depth)
+    -- Omitir interior de tabs si está configurado
+    if CFG.SKIP_TABS and nm:find("^TabFrame_") then
+        _ins(lines, _fmt('%s-- [OMITIDO] TabFrame "%s"', ind, nm))
+        _ins(lines, "")
+        return lines, nil
+    end
 
-    -- ── Creación ──────────────────────────────────────────────────────────
-    _ins(lines, _fmt('%s-- [%s] "%s"', ind, cn, instName))
-    _ins(lines, _fmt('%slocal %s = Instance.new("%s")', ind, varName, cn))
+    _ins(lines, _fmt('%s-- [%s] %q', ind, cn, nm))
+    _ins(lines, _fmt('%slocal %s = Instance.new("%s")', ind, var, cn))
 
-    -- ── Propiedades ───────────────────────────────────────────────────────
-    local props = propsForClass(cn)
-    for _, prop in ipairs(props) do
-        local val, ok = nil, false
-        _pcall(function() val = inst[prop]; ok = true end)
+    -- Propiedades
+    local props = propsFor(cn)
+    for _, prop in _ipairs(props) do
+        local ok, val = safeProp(inst, prop)
         if ok and val ~= nil then
-            local forced  = FORCE_PROPS_SET[prop]
-            local default = DEFAULTS[prop]
-            -- Omitir si es default y no es forzada
-            if not forced and default ~= nil and valEq(val, default) then
-                -- skip
-            else
-                -- Evitar serializar Position=(0,0,0,0) y Size=(0,0,0,0) para contenedores
-                -- excepto si es ScreenGui
-                if cn ~= "ScreenGui"
-                    and (prop == "Position" or prop == "Size")
-                    and _typeof(val) == "UDim2"
-                    and val.X.Scale == 0 and val.X.Offset == 0
-                    and val.Y.Scale == 0 and val.Y.Offset == 0
-                    and not forced then
-                    -- skip cero por defecto (en ScreenGui no tiene sentido)
+            local forced  = CFG.FORCE_PROPS[prop]
+            local def     = DEFAULTS[prop]
+            if forced or (def == nil) or (not valEq(val, def)) then
+                -- Omitir Size/Position UDim2 cero si no es forzado
+                if not forced and (prop=="Position" or prop=="Size")
+                    and _typeof(val)=="UDim2"
+                    and val.X.Scale==0 and val.X.Offset==0
+                    and val.Y.Scale==0 and val.Y.Offset==0 then
+                    -- skip
                 else
-                    local sv = serValue(val)
+                    local sv = serVal(val)
                     if sv and sv ~= "nil" then
-                        _ins(lines, _fmt('%s%s.%s = %s', ind, varName, prop, sv))
+                        _ins(lines, _fmt('%s%s.%s = %s', ind, var, prop, sv))
                     end
                 end
             end
         end
     end
 
-    -- ── Parent ────────────────────────────────────────────────────────────
     if parentVar then
-        _ins(lines, _fmt('%s%s.Parent = %s', ind, varName, parentVar))
+        _ins(lines, _fmt('%s%s.Parent = %s', ind, var, parentVar))
     end
     _ins(lines, "")
 
-    -- ── Hijos ─────────────────────────────────────────────────────────────
+    -- Hijos
     local children = {}
     _pcall(function() children = inst:GetChildren() end)
-
-    for _, child in ipairs(children) do
-        -- Si SKIP_TABS_CONTENT, omitir frames de contenido de tabs (ScrollingFrame con TabFrame_ prefix)
-        if CFG.SKIP_TABS_CONTENT then
-            local cname = ""
-            _pcall(function() cname = child.Name end)
-            if cname:find("^TabFrame_") then
-                _ins(lines, _fmt('%s-- [OMITTED] TabFrame "%s" (SKIP_TABS_CONTENT=true)', ind .. "    ", cname))
-                _ins(lines, "")
-                goto continue_child
-            end
-        end
-
-        serInst(child, varName, depth + 1, lines, counters, rootCn)
-
-        ::continue_child::
+    for _, child in _ipairs(children) do
+        serInst(child, var, depth+1, lines, counters)
     end
 
-    return lines, varName
+    return lines, var
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- GENERACIÓN DEL ARCHIVO FINAL
+-- GENERACIÓN DE CÓDIGO COMPLETO
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local function generateCode(guiRoots)
+local function buildCode(roots)
     local lines = {}
-
     _ins(lines, "--[[")
-    _ins(lines, "  BKS HUB — GUI Original Extraída por BKS_GUI_EXTRACTOR_v1")
-    _ins(lines, "  Fecha: " .. _tostr(os.date and os.date("%Y-%m-%d %H:%M:%S") or tick()))
-    _ins(lines, "  Propiedades extraídas del árbol de instancias REAL en tiempo de ejecución.")
-    _ins(lines, "  Para usar: pegar en un executor de Roblox y ejecutar.")
+    _ins(lines, "  BKS HUB — GUI Original (BKS_GUI_EXTRACTOR_v2)")
+    _ins(lines, "  Generado: " .. _tostr(tick()))
+    _ins(lines, "  Instancias reales extraídas de PlayerGui/CoreGui en runtime.")
     _ins(lines, "--]]")
     _ins(lines, "")
-    _ins(lines, 'local Players           = game:GetService("Players")')
-    _ins(lines, 'local UserInputService  = game:GetService("UserInputService")')
-    _ins(lines, 'local TweenService      = game:GetService("TweenService")')
-    _ins(lines, 'local RunService        = game:GetService("RunService")')
-    _ins(lines, 'local LocalPlayer       = Players.LocalPlayer')
-    _ins(lines, 'local PlayerGui         = LocalPlayer:WaitForChild("PlayerGui")')
+    _ins(lines, 'local Players = game:GetService("Players")')
+    _ins(lines, 'local UIS     = game:GetService("UserInputService")')
+    _ins(lines, 'local LP      = Players.LocalPlayer')
+    _ins(lines, 'local PG      = LP:WaitForChild("PlayerGui")')
     _ins(lines, "")
-    _ins(lines, "-- Limpiar GUI anterior si existe")
-    _ins(lines, 'for _, n in ipairs({"' .. CFG.SGUI_MAIN .. '", "' ..
-        CFG.SGUI_OVERLAY .. '", "' .. CFG.SGUI_OPENBTN .. '"}) do')
-    _ins(lines, '    local old = PlayerGui:FindFirstChild(n)')
+    -- Limpiar GUIs anteriores
+    _ins(lines, "-- Limpiar instancias anteriores del hub")
+    _ins(lines, 'for _, nm in ipairs({"' .. _cat(CFG.SGUI_NAMES, '","') .. '"}) do')
+    _ins(lines, '    local old = PG:FindFirstChild(nm)')
     _ins(lines, '    if old then old:Destroy() end')
     _ins(lines, 'end')
     _ins(lines, "")
-    _ins(lines, "-- ════════════════════════════════════════════════════")
+    _ins(lines, "-- ══════════════════════════════════════════")
     _ins(lines, "-- GUI ORIGINAL")
-    _ins(lines, "-- ════════════════════════════════════════════════════")
+    _ins(lines, "-- ══════════════════════════════════════════")
     _ins(lines, "")
 
-    local counters  = {}
-    local firstVar  = nil
-    for _, root in ipairs(guiRoots) do
-        local rootLines, rootVar = serInst(root, "PlayerGui", 0, {}, counters)
-        if not firstVar then firstVar = rootVar end
-        for _, l in ipairs(rootLines) do _ins(lines, l) end
+    local counters = {}
+    local firstVar = nil
+    for _, root in _ipairs(roots) do
+        local rlines, rvar = serInst(root, "PG", 0, {}, counters)
+        if rvar and not firstVar then firstVar = rvar end
+        for _, l in _ipairs(rlines) do _ins(lines, l) end
     end
 
-    -- Footer: keybind toggle
+    -- Keybind
     _ins(lines, "")
-    _ins(lines, "-- ════════════════════════════════════════════════════")
-    _ins(lines, "-- KEYBIND TOGGLE (U por defecto)")
-    _ins(lines, "-- ════════════════════════════════════════════════════")
+    _ins(lines, "-- ══════════════════════════════════════════")
+    _ins(lines, "-- KEYBIND TOGGLE (U = mostrar/ocultar)")
+    _ins(lines, "-- ══════════════════════════════════════════")
     if firstVar then
-        _ins(lines, "local _hub_sg = " .. firstVar)
-        _ins(lines, "UserInputService.InputBegan:Connect(function(inp, gpe)")
+        _ins(lines, "local _sg = " .. firstVar)
+        _ins(lines, "UIS.InputBegan:Connect(function(inp, gpe)")
         _ins(lines, "    if gpe then return end")
-        _ins(lines, "    if inp.UserInputType == Enum.UserInputType.Keyboard then")
-        _ins(lines, "        if inp.KeyCode == Enum.KeyCode.U then")
-        _ins(lines, "            _hub_sg.Enabled = not _hub_sg.Enabled")
-        _ins(lines, "        end")
+        _ins(lines, "    if inp.KeyCode == Enum.KeyCode.U then")
+        _ins(lines, "        _sg.Enabled = not _sg.Enabled")
         _ins(lines, "    end")
         _ins(lines, "end)")
     end
     _ins(lines, "")
-    _ins(lines, 'print("[BKS GUI] Cargada correctamente.")')
-
+    _ins(lines, 'print("[BKS GUI v2] Cargada.")')
     return _cat(lines, "\n")
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- GUARDADO
+-- BÚSQUEDA DE GUIs DEL HUB
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local function tryClipboard(text)
-    local ok = _pcall(setclipboard, text)
-    if ok then return true end
-    -- Alternativa: algunos executors usan Clipboard
-    ok = _pcall(function() Clipboard:SetText(text) end)
-    return ok
-end
+local function findRoots()
+    local roots  = {}
+    local seen   = {}
 
-local function tryHastebin(text)
-    local ok, res = _pcall(function()
-        return request({
-            Url     = "https://hastebin.com/documents",
-            Method  = "POST",
-            Body    = text,
-            Headers = { ["Content-Type"] = "text/plain" },
-        })
-    end)
-    if not ok or not res then return nil end
-    local ok2, data = _pcall(function()
-        return game:GetService("HttpService"):JSONDecode(res.Body)
-    end)
-    if ok2 and data and data.key then
-        return "https://hastebin.com/" .. data.key
-    end
-    return nil
-end
-
--- Subir a Rentry (alternativa a hastebin, soporta textos grandes)
-local function tryRentry(text)
-    local ok, res = _pcall(function()
-        return request({
-            Url     = "https://rentry.co/api",
-            Method  = "POST",
-            Body    = "text=" .. game:GetService("HttpService"):UrlEncode(text),
-            Headers = {
-                ["Content-Type"] = "application/x-www-form-urlencoded",
-                ["Referer"]      = "https://rentry.co",
-            },
-        })
-    end)
-    if not ok or not res then return nil end
-    local ok2, data = _pcall(function()
-        return game:GetService("HttpService"):JSONDecode(res.Body)
-    end)
-    if ok2 and data and data.url then
-        return data.url .. "/raw"
-    end
-    return nil
-end
-
--- ─────────────────────────────────────────────────────────────────────────────
--- NOTIFICACIÓN
--- ─────────────────────────────────────────────────────────────────────────────
-
-local function notify(title, msg, duration)
-    _pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title    = title,
-            Text     = msg,
-            Duration = duration or 5,
-        })
-    end)
-    print("[BKS GUI Extractor] " .. title .. " — " .. msg)
-end
-
--- ─────────────────────────────────────────────────────────────────────────────
--- BÚSQUEDA DE RAÍCES GUI
--- ─────────────────────────────────────────────────────────────────────────────
-
-local function findGuiRoots()
-    local roots = {}
-
-    -- Función auxiliar de búsqueda
-    local function tryFind(container, name)
-        local ok, child = _pcall(function()
-            return container:FindFirstChild(name)
-        end)
-        return ok and child or nil
+    local function tryAdd(container, nm)
+        if seen[nm] then return end
+        local ok, inst = _pcall(function() return container:FindFirstChild(nm) end)
+        if ok and inst then seen[nm]=true; _ins(roots, inst) end
     end
 
-    -- ScreenGui principal
-    local main = tryFind(PlayerGui, CFG.SGUI_MAIN)
-               or tryFind(CoreGui,   CFG.SGUI_MAIN)
-    if main then _ins(roots, main) end
+    -- Nombres conocidos
+    for _, nm in _ipairs(CFG.SGUI_NAMES) do
+        tryAdd(PlayerGui, nm)
+        tryAdd(CoreGuiSvc, nm)
+    end
 
-    -- Overlay de carga
-    local ov = tryFind(PlayerGui, CFG.SGUI_OVERLAY)
-            or tryFind(CoreGui,   CFG.SGUI_OVERLAY)
-    if ov then _ins(roots, ov) end
-
-    -- Botón de abrir (minimized)
-    local ob = tryFind(PlayerGui, CFG.SGUI_OPENBTN)
-            or tryFind(CoreGui,   CFG.SGUI_OPENBTN)
-    if ob then _ins(roots, ob) end
-
-    -- Fallback: buscar cualquier ScreenGui con nombre "_zk*"
+    -- Fallback: cualquier ScreenGui con prefijo _zk en PlayerGui
     if #roots == 0 then
-        for _, child in ipairs(PlayerGui:GetChildren()) do
-            local cn = ""
-            local nm = ""
-            _pcall(function() cn = child.ClassName end)
-            _pcall(function() nm = child.Name end)
-            if cn == "ScreenGui" and nm:sub(1,3) == "_zk" then
-                _ins(roots, child)
+        local ok, children = _pcall(function() return PlayerGui:GetChildren() end)
+        if ok then
+            for _, c in _ipairs(children) do
+                local cn = safeClassName(c)
+                local nm = safeName(c)
+                if cn == "ScreenGui" and nm:sub(1,3) == "_zk" and not seen[nm] then
+                    seen[nm] = true
+                    _ins(roots, c)
+                end
+            end
+        end
+    end
+
+    -- Fallback CoreGui
+    if #roots == 0 then
+        local ok, children = _pcall(function() return CoreGuiSvc:GetChildren() end)
+        if ok then
+            for _, c in _ipairs(children) do
+                local cn = safeClassName(c)
+                local nm = safeName(c)
+                if cn == "ScreenGui" and nm:sub(1,3) == "_zk" and not seen[nm] then
+                    seen[nm] = true
+                    _ins(roots, c)
+                end
             end
         end
     end
@@ -700,131 +513,298 @@ local function findGuiRoots()
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- EJECUCIÓN PRINCIPAL
+-- GUARDADO
 -- ─────────────────────────────────────────────────────────────────────────────
 
-local function runExtraction()
-    notify("BKS GUI Extractor", "Buscando GUI del hub...", 4)
+local function clipSave(text)
+    if not CFG.SAVE_CLIPBOARD then return false end
+    local ok = _pcall(setclipboard, text)
+    if ok then return true end
+    ok = _pcall(function() Clipboard:SetText(text) end)
+    return ok
+end
 
-    local roots = findGuiRoots()
-    if #roots == 0 then
-        notify("BKS GUI Extractor",
-            "⚠ No se encontró la GUI. ¿Cargó el hub? (buscando _zk768057)", 8)
+local function hasteSave(text)
+    if not CFG.SAVE_HASTEBIN then return nil end
+    local ok, res = _pcall(function()
+        return request({
+            Url    = "https://hastebin.com/documents",
+            Method = "POST", Body = text,
+            Headers = {["Content-Type"]="text/plain"},
+        })
+    end)
+    if ok and res and res.Body then
+        local ok2, data = _pcall(function() return HttpSvc:JSONDecode(res.Body) end)
+        if ok2 and data and data.key then
+            return "https://hastebin.com/" .. data.key
+        end
+    end
+    return nil
+end
+
+local function rentrySave(text)
+    if not CFG.SAVE_HASTEBIN then return nil end
+    local ok, res = _pcall(function()
+        return request({
+            Url    = "https://rentry.co/api",
+            Method = "POST",
+            Body   = "text=" .. HttpSvc:UrlEncode(text),
+            Headers = {
+                ["Content-Type"] = "application/x-www-form-urlencoded",
+                ["Referer"]      = "https://rentry.co",
+            },
+        })
+    end)
+    if ok and res and res.Body then
+        local ok2, data = _pcall(function() return HttpSvc:JSONDecode(res.Body) end)
+        if ok2 and data and data.url then return data.url .. "/raw" end
+    end
+    return nil
+end
+
+local function chunkPrint(text)
+    if not CFG.PRINT_CHUNKS then return end
+    local CHUNK = 3500
+    local total = #text
+    local n     = math.ceil(total / CHUNK)
+    print(_fmt("[BKS GE] Imprimiendo %d chunks...", n))
+    for i = 1, total, CHUNK do
+        print(text:sub(i, i+CHUNK-1))
+        task.wait(0.05)
+    end
+    print("[BKS GE] ── FIN ──")
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- NOTIFICACIÓN
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function notify(title, msg, dur)
+    _pcall(function()
+        StarterGuiSvc:SetCore("SendNotification", {
+            Title=title, Text=msg, Duration=dur or 5,
+        })
+    end)
+    print("[BKS GE] " .. title .. " — " .. msg)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- HOOK DE Instance.new
+-- Captura CADA instancia GUI mientras el hub las crea.
+-- Si buildGUI() crashea a mitad, tendremos todo lo que se creó hasta ese punto.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local hookedInstances = {}   -- tabla de todas las instancias GUI hookeadas
+local hookActive      = false
+
+local function setupInstanceHook()
+    -- Solo hookear si hookfunction está disponible
+    local _hf = rawget(getfenv and getfenv(0) or _G, "hookfunction")
+                or (getgenv and getgenv().hookfunction)
+    if not _hf then
+        print("[BKS GE] hookfunction no disponible — usando solo snapshot")
         return false
     end
 
-    notify("BKS GUI Extractor",
-        "GUI encontrada (" .. #roots .. " ScreenGui). Serializando...", 5)
-
-    -- Serializar
-    local code = generateCode(roots)
-    local bytes = #code
-    local lineCount = select(2, code:gsub("\n", "")) + 1
-
-    print(_fmt("[BKS GUI Extractor] Output: %d líneas, %.1f KB", lineCount, bytes/1024))
-
-    -- Intentar guardar
-    local saved  = false
-    local saveMsg = ""
-
-    if CFG.SAVE_HASTEBIN then
-        notify("BKS GUI Extractor", _fmt("%.0f KB generados. Subiendo...", bytes/1024), 4)
-
-        -- Intentar hastebin primero
-        local url = tryHastebin(code)
-        if url then
-            saveMsg = "URL: " .. url
-            tryClipboard(url)  -- URL en clipboard
-            saved = true
-            notify("BKS GUI Extractor",
-                _fmt("✓ Subido! (%.0f KB)\n%s", bytes/1024, url), 12)
-            print("[BKS GUI Extractor] Hastebin URL: " .. url)
-        else
-            -- Intentar rentry
-            url = tryRentry(code)
-            if url then
-                saveMsg = "Rentry: " .. url
-                tryClipboard(url)
-                saved = true
-                notify("BKS GUI Extractor",
-                    _fmt("✓ Rentry! (%.0f KB)\n%s", bytes/1024, url), 12)
-                print("[BKS GUI Extractor] Rentry URL: " .. url)
-            end
-        end
+    local _nc = rawget(getfenv and getfenv(0) or _G, "newcclosure")
+                or (getgenv and getgenv().newcclosure)
+    if not _nc then
+        print("[BKS GE] newcclosure no disponible — usando solo snapshot")
+        return false
     end
 
-    -- Si no se subió online, usar clipboard
-    if not saved and CFG.SAVE_CLIPBOARD then
-        local clipOk = tryClipboard(code)
-        if clipOk then
-            saved = true
-            notify("BKS GUI Extractor",
-                _fmt("✓ En clipboard! (%.0f KB)", bytes/1024), 8)
-        else
-            notify("BKS GUI Extractor",
-                "⚠ Clipboard falló. Imprimiendo en consola...", 5)
-        end
-    end
+    local realInstanceNew = Instance.new
+    local _holder = { fn = nil }
 
-    -- Último recurso: print en chunks
-    if not saved or CFG.PRINT_CHUNKS then
-        local CHUNK = 3000
-        local total = #code
-        local chunks = math.ceil(total / CHUNK)
-        print(_fmt("[BKS GUI Extractor] Imprimiendo %d chunks de %d chars...", chunks, CHUNK))
-        for i = 1, total, CHUNK do
-            print(code:sub(i, i + CHUNK - 1))
-            task.wait(0.05)  -- evitar throttle
+    _holder.fn = _hf(Instance.new, _nc(function(cn, parent)
+        local inst = _holder.fn(cn, parent)
+        if SERIALIZE[cn] then
+            -- Registrar con un pequeño delay para que las propiedades se apliquen
+            _ins(hookedInstances, inst)
         end
-        print("[BKS GUI Extractor] ── FIN DEL OUTPUT ──")
-    end
+        return inst
+    end))
 
+    hookActive = true
+    print("[BKS GE] Instance.new hookeado — capturando instancias GUI...")
     return true
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- ENTRY POINT
+-- EXTRACCIÓN PRINCIPAL
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local extractionDone = false
+
+local function doExtract(source)
+    if extractionDone then
+        notify("BKS GE", "Ya se extrajo. Reinicia para volver a capturar.", 5)
+        return
+    end
+    extractionDone = true
+
+    notify("BKS GE", "Buscando GUI... (" .. source .. ")", 4)
+
+    -- Estrategia 1: snapshot del árbol actual (mejor calidad)
+    local roots = findRoots()
+
+    if #roots == 0 then
+        -- Estrategia 2: usar instancias hookeadas si el hub crasheó antes de llegar a PlayerGui
+        if hookActive and #hookedInstances > 0 then
+            notify("BKS GE",
+                _fmt("Snapshot vacío. Usando %d instancias hookeadas...", #hookedInstances), 5)
+            -- Filtrar instancias que aún existen y son ScreenGui o hijos de una
+            local sgs = {}
+            for _, inst in _ipairs(hookedInstances) do
+                local ok, cn = _pcall(function() return inst.ClassName end)
+                if ok and cn == "ScreenGui" then
+                    _ins(sgs, inst)
+                end
+            end
+            if #sgs > 0 then
+                roots = sgs
+            end
+        end
+    end
+
+    if #roots == 0 then
+        notify("BKS GE",
+            "⚠ No se encontró GUI. El hub no llegó a crear la ScreenGui.\n" ..
+            "Prueba: carga el hub primero, luego presiona F8.", 10)
+        extractionDone = false  -- permitir reintento
+        return
+    end
+
+    notify("BKS GE",
+        _fmt("Encontradas %d ScreenGui. Serializando...", #roots), 5)
+
+    -- Generar código
+    local code      = buildCode(roots)
+    local bytes     = #code
+    local lineCount = select(2, code:gsub("\n","")) + 1
+
+    print(_fmt("[BKS GE] Output: %d líneas, %.1f KB", lineCount, bytes/1024))
+
+    -- Intentar guardar
+    local saved = false
+    local url   = nil
+
+    -- Hastebin / Rentry (mejor para archivos grandes)
+    if bytes > 100000 then
+        notify("BKS GE", _fmt("%.0f KB — subiendo a hastebin...", bytes/1024), 5)
+        url = hasteSave(code)
+        if not url then url = rentrySave(code) end
+        if url then
+            saved = true
+            clipSave(url)   -- URL en clipboard
+            notify("BKS GE",
+                _fmt("✓ Subido! (%.0f KB)\n%s", bytes/1024, url), 15)
+            print("[BKS GE] URL: " .. url)
+        end
+    end
+
+    -- Clipboard (para archivos pequeños o si hastebin falló)
+    if not saved then
+        local clipped = clipSave(code)
+        if clipped then
+            saved = true
+            notify("BKS GE", _fmt("✓ En clipboard! (%.0f KB)", bytes/1024), 8)
+        end
+        -- También intentar hastebin como backup
+        if CFG.SAVE_HASTEBIN and not url then
+            url = hasteSave(code) or rentrySave(code)
+            if url then
+                print("[BKS GE] Backup URL: " .. url)
+                notify("BKS GE", "Backup en hastebin: " .. url, 10)
+            end
+        end
+    end
+
+    -- Último recurso: print chunks
+    if not saved then
+        notify("BKS GE", "Clipboard y hastebin fallaron. Imprimiendo en consola...", 5)
+        chunkPrint(code)
+    elseif CFG.PRINT_CHUNKS then
+        -- Imprimir de todas formas como backup adicional
+        chunkPrint(code)
+    end
+
+    notify("BKS GE", "✓ Extracción completa.", 5)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- KEYBIND MANUAL (F8 = capturar ahora)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+UIS.InputBegan:Connect(function(inp, gpe)
+    if gpe then return end
+    if inp.UserInputType == Enum.UserInputType.Keyboard then
+        if inp.KeyCode == CFG.MANUAL_KEY then
+            task.spawn(doExtract, "tecla manual F8")
+        end
+    end
+end)
+
+notify("BKS GE", "Listo. F8 = capturar ahora.", 6)
+print("[BKS GE] Keybind F8 activo. Esperando hub...")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- HOOK Instance.new (antes de cargar el hub)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+setupInstanceHook()
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MODO AUTO: esperar GUI o capturar inmediato
 -- ─────────────────────────────────────────────────────────────────────────────
 
 if not CFG.WAIT_FOR_HUB then
-    -- Captura inmediata (hub ya cargado)
-    task.spawn(runExtraction)
+    -- Captura inmediata
+    task.spawn(function()
+        task.wait(0.5)
+        doExtract("inmediato")
+    end)
 else
-    -- Modo espera: monitorear PlayerGui y CoreGui hasta que aparezca la GUI
-    notify("BKS GUI Extractor",
-        "Esperando que el hub cargue (timeout: " .. CFG.TIMEOUT .. "s)...", 6)
-
+    -- Modo espera automática
     task.spawn(function()
         local t0    = tick()
         local found = false
 
-        while (tick() - t0) < CFG.TIMEOUT do
-            -- Chequear PlayerGui
-            local sg = PlayerGui:FindFirstChild(CFG.SGUI_MAIN)
+        while (tick()-t0) < CFG.TIMEOUT do
+            -- Buscar cualquier _zk* ScreenGui
+            local sg = nil
+            _pcall(function()
+                for _, nm in _ipairs(CFG.SGUI_NAMES) do
+                    sg = PlayerGui:FindFirstChild(nm)
+                    if sg then break end
+                end
+            end)
             if not sg then
                 _pcall(function()
-                    sg = CoreGui:FindFirstChild(CFG.SGUI_MAIN)
+                    for _, c in _ipairs(PlayerGui:GetChildren()) do
+                        if safeClassName(c) == "ScreenGui"
+                        and safeName(c):sub(1,3) == "_zk" then
+                            sg = c; break
+                        end
+                    end
                 end)
             end
-            -- Fallback: cualquier _zk* ScreenGui
+            -- También buscar en CoreGui
             if not sg then
-                for _, c in ipairs(PlayerGui:GetChildren()) do
-                    local cn, nm = "", ""
-                    _pcall(function() cn = c.ClassName end)
-                    _pcall(function() nm = c.Name end)
-                    if cn == "ScreenGui" and nm:sub(1,3) == "_zk" then
-                        sg = c; break
+                _pcall(function()
+                    for _, nm in _ipairs(CFG.SGUI_NAMES) do
+                        sg = CoreGuiSvc:FindFirstChild(nm)
+                        if sg then break end
                     end
-                end
+                end)
             end
 
             if sg then
                 found = true
-                -- Esperar extra para que buildGUI() termine de poblar el árbol
-                notify("BKS GUI Extractor",
-                    "GUI detectada. Esperando " .. CFG.WAIT_EXTRA .. "s...", 3)
+                notify("BKS GE",
+                    "GUI detectada. Esperando " .. CFG.WAIT_EXTRA .. "s...", 4)
                 task.wait(CFG.WAIT_EXTRA)
-                runExtraction()
+                doExtract("auto-detect")
                 break
             end
 
@@ -832,9 +812,9 @@ else
         end
 
         if not found then
-            notify("BKS GUI Extractor",
-                "⚠ Timeout (" .. CFG.TIMEOUT .. "s). Hub no encontrado.", 8)
+            notify("BKS GE",
+                _fmt("Timeout (%ds). Hub no encontrado. Presiona F8 para intentar ahora.", CFG.TIMEOUT),
+                10)
         end
     end)
 end
-print("[BKS GUI Extractor] Inicializado.")
